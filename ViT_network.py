@@ -31,6 +31,8 @@ parser.add_argument('--nepochs','-ne', type=int, default=101, required=False,hel
 parser.add_argument('--lr','-lr', type=float, default=0.0005, required=False,help='learning rate')
 parser.add_argument('--batch_size','-bs', type=int, default=1, required=False,help='batch size')
 parser.add_argument('--output_dir','-od', type=str, default='ViT_debug', required=False,help='output directory for figures')
+parser.add_argument('--data_augmentation','-aug', type=bool, default=False, required=False,help='data augmentation')
+parser.add_argument('--decay','-dec', type=float, default=0, required=False,help='weight decay')
 
 args = parser.parse_args()
 
@@ -45,14 +47,21 @@ test_folder=glob.glob(f'{files_path}/test/*')
 
 setup_directories(name=args.output_dir)
 
-
+# Verify the dataset
+print('VERIFYING DATASET')
+bad_files = verify([train_folder,validate_folder,test_folder])
 #%%
 class CustomDataset(Dataset):
+    '''
+    Custom dataset class: load data from a folder, transform into pytorch tensors
+    inputs: folder: list of files
+            transform: data augmentation
+    outputs: data: list of shotgathers
+             labels: list of Vs profiles
+    '''
     def __init__(self, folder, transform=None):
         self.data, self.labels = self.load_data_from_folder(folder)
-        self.transform = transform or transforms.Compose([
-            transforms.ToTensor()
-        ])
+        self.transform = transform
 
     def load_data_from_folder(self, folder):
         data = []
@@ -61,15 +70,23 @@ class CustomDataset(Dataset):
         for file_path in folder:
             with h5.File(file_path, 'r') as h5file:
                 inputs = h5file['shotgather'][:]
+                len_inp = inputs.shape[1]
+                half_ind = len_inp // 2
+                inputs = h5file['shotgather'][:, half_ind:]
                 labels_data = h5file['vsdepth'][:]
 
                 inputs = (inputs - np.min(inputs)) / (np.max(inputs) - np.min(inputs))
+
+                transform_tensor = transforms.Compose([
+                    transforms.ToTensor()
+                ])
+
+                inputs = transform_tensor(inputs)
 
                 data.append(inputs)
                 labels.append(labels_data)
 
         data = np.array(data)
-
 
         labels = np.array(labels)
         return data, labels
@@ -85,19 +102,35 @@ class CustomDataset(Dataset):
         inputs = torch.tensor(inputs, dtype=torch.float32)
         labels = torch.tensor(labels, dtype=torch.float32)
 
-        sample = {'data': inputs, 'label': labels}
-
         if self.transform:
-            sample = self.transform(sample)
+            inputs = self.transform(inputs)
+
+        sample = {'data': inputs, 'label': labels}
 
         return sample
 
 def create_datasets(data_path, dataset_name):
+    '''
+    Create train, validate and test datasets, apply data augmentation if needed
+    :param data_path: path to the data
+    :param dataset_name: name of the dataset folder
+    :return: train_dataset, validate_dataset, test_dataset
+    '''
     train_folder = glob.glob(os.path.join(data_path, dataset_name, 'train', '*'))
     validate_folder = glob.glob(os.path.join(data_path, dataset_name, 'validate', '*'))
     test_folder = glob.glob(os.path.join(data_path, dataset_name, 'test', '*'))
 
-    train_dataset = CustomDataset(train_folder)
+    if args.data_augmentation:
+        view_transform = transforms.Compose(
+            [
+                DeadTraces(),
+                MissingTraces(),
+                GaussianNoise(mean=0, std=0.1),
+            ]
+        )
+        train_dataset = CustomDataset(train_folder,transform=view_transform)
+    else:
+        train_dataset = CustomDataset(train_folder)
     validate_dataset = CustomDataset(validate_folder)
     test_dataset = CustomDataset(test_folder)
 
@@ -111,12 +144,13 @@ val_dataloader = DataLoader(validate_dataset, batch_size=args.batch_size, shuffl
 test_dataloader = DataLoader(test_dataset, batch_size=args.batch_size, shuffle=True)
 
 
-
 #%%
 print('INFORMATION ABOUT THE DATASET:')
 print('Image size: ',train_dataloader.dataset.data[0].shape)
+channels,img_height, img_width = train_dataloader.dataset.data[0].shape
 print('Label size: ',train_dataloader.dataset.labels[0].shape)
-out_dim=len(train_dataloader.dataset.labels[0])
+lab_size= train_dataloader.dataset.labels[0].shape[0]
+out_dim=lab_size
 print('Output dimension: ',out_dim)
 print('\n')
 
@@ -129,17 +163,25 @@ print('min:',train_dataloader.dataset.data[0].min(),' max:', train_dataloader.da
 
 #%%
 def plot_random_samples(train_dataloader, num_samples=5,od=args.output_dir):
+    '''
+    Display random samples, shot gathers and Vs profiles
+    :param train_dataloader: dataloader
+    :param num_samples: number of samples to display
+    :param od: output directory
+    :return: None, save the figure in the output directory
+    '''
     fig, axs = plt.subplots(num_samples, 2, figsize=(15, 5 * num_samples))
 
     for i in range(num_samples):
         # Sélectionner un échantillon aléatoire
         idx = random.randint(0, len(train_dataloader.dataset) - 1)
-        image = train_dataloader.dataset.data[idx]
-
-        label= train_dataloader.dataset.labels[idx]
+        sample = train_dataloader.dataset[idx]
+        image = sample['data']
+        label = sample['label']
+        #print('shape image=', image.shape)
 
         # Afficher l'image dans la première colonne
-        axs[i, 0].imshow(image, aspect='auto', cmap='gray')
+        axs[i, 0].imshow(image[0], aspect='auto', cmap='gray')
         axs[i, 0].set_title(f'Shot Gather {i + 1}')
         axs[i, 0].set_xlabel('Distance (m)')
         axs[i, 0].set_ylabel('Time (sample)')
@@ -161,7 +203,10 @@ plot_random_samples(train_dataloader, num_samples=5)
 
 #%%
 class PatchEmbedding(nn.Module):
-    def __init__(self, in_channels = 1, patch_height=41,patch_width=12, emb_size = 120):
+    '''
+    Patch Embedding class
+    '''
+    def __init__(self, in_channels = 1, patch_height=img_height/5,patch_width=img_width/4, emb_size = 120):
 
         super().__init__()
         self.projection = nn.Sequential(
@@ -177,6 +222,9 @@ class PatchEmbedding(nn.Module):
 
 #%%
 class Attention(nn.Module):
+    '''
+    Attention class
+    '''
     def __init__(self, dim, n_heads, dropout):
         super().__init__()
         self.n_heads = n_heads
@@ -196,6 +244,9 @@ class Attention(nn.Module):
 
 #%%
 class PreNorm(nn.Module):
+    '''
+    PreNorm class
+    '''
     def __init__(self, dim, fn):
         super().__init__()
         self.norm = nn.LayerNorm(dim)
@@ -204,6 +255,9 @@ class PreNorm(nn.Module):
         return self.fn(self.norm(x), **kwargs)
 
 class FeedForward(nn.Sequential):
+    '''
+    FeedForward class
+    '''
     def __init__(self, dim, hidden_dim, dropout = 0.):
         super().__init__(
             nn.Linear(dim, hidden_dim),
@@ -215,6 +269,9 @@ class FeedForward(nn.Sequential):
 
 #%%
 class ResidualAdd(nn.Module):
+    '''
+    Residual connection class
+    '''
     def __init__(self, fn):
         super().__init__()
         self.fn = fn
@@ -227,7 +284,10 @@ class ResidualAdd(nn.Module):
 
 #%%
 class ViT(nn.Module):
-    def __init__(self, ch=1, img_height=205,img_width=24, emb_dim=36,
+    '''
+    Vision Transformer class, composed of PatchEmbedding, PositionalEncoding, TransformerEncoder, and RegressionHead
+    '''
+    def __init__(self, ch=1, img_height=img_height,img_width=img_width, emb_dim=36,
                 n_layers=12, out_dim=out_dim, dropout=0.1, heads=12):
         super(ViT, self).__init__()
 
@@ -237,6 +297,7 @@ class ViT(nn.Module):
         self.img_width = img_width
         self.patch_height= img_height // 5
         self.patch_width =  img_width // 2
+        print(f'patch size: {self.patch_height}x{self.patch_width}')
         self.n_layers = n_layers
 
         # Patching
@@ -290,8 +351,7 @@ print('MODEL ARCHITECTURE:')
 model = ViT()
 print(model)
 
-#%%
-def training(device=None,lr=0.0005,nepochs=101):
+def training(device=None,lr=0.0001,nepochs=21):
     print('\nTRAINING LOOP:')
     # GPU or CPU
     if device is None:
@@ -305,8 +365,10 @@ def training(device=None,lr=0.0005,nepochs=101):
 
     # Initializations
     # Define optimizer and loss function
-    optimizer = optim.AdamW(model.parameters(), lr=lr)  # Optimizer for training, and learning rate
-    print('Optimizer: AdamW')
+    #optimizer = optim.AdamW(model.parameters(), lr=lr)  # Optimizer for training, and learning rate
+    optimizer = optim.Adam(model.parameters(), lr=lr,weight_decay=args.decay)  # Optimizer for training, and learning rate
+    print(f'Optimizer:{optimizer} Learning rate: {lr}')
+    print('Learning rate:',lr)
     criterion = nn.MSELoss()  # Loss function for regression
     print('Loss function: MSE')
     train_losses = []
@@ -320,9 +382,14 @@ def training(device=None,lr=0.0005,nepochs=101):
         epoch_losses = []
         model.train()
         for step in range(len(train_dataloader)):
-            inputs= torch.tensor(train_dataloader.dataset.data[step], dtype=torch.float32)
-            inputs= inputs.unsqueeze(0).unsqueeze(0)
-            labels = torch.tensor(train_dataloader.dataset.labels[step], dtype=torch.float32)
+            sample= train_dataloader.dataset[step]
+            inputs = sample['data']
+            labels = sample['label']
+            #inputs= torch.tensor(train_dataloader.dataset.data[step], dtype=torch.float32)
+
+
+            inputs= inputs.unsqueeze(0)
+            #labels = torch.tensor(train_dataloader.dataset.labels[step], dtype=torch.float32)
             inputs, labels = inputs.to(device), labels.to(device)
             optimizer.zero_grad()
             outputs = model(inputs)
@@ -343,9 +410,10 @@ def training(device=None,lr=0.0005,nepochs=101):
             # model.eval()
             # Validation loop, every 5 epochs
             for step in range(len(val_dataloader)):
-                inputs = torch.tensor(val_dataloader.dataset.data[step], dtype=torch.float32)
-                labels= torch.tensor(val_dataloader.dataset.labels[step], dtype=torch.float32)
-                inputs= inputs.unsqueeze(0).unsqueeze(0)
+                sample = val_dataloader.dataset[step]
+                inputs = sample['data']
+                labels = sample['label']
+                inputs= inputs.unsqueeze(0)
                 inputs, labels = inputs.to(device), labels.to(device)
                 outputs = model(inputs)
                 #print('shape outputs:',outputs.shape,'shape labels:' ,labels.shape)
@@ -370,6 +438,7 @@ def learning_curves(epochs_count_train, train_losses, epochs_count_val, val_loss
     plt.plot(epochs_count_val, val_losses, label='Validation Loss')
     plt.xlabel('Epoch')
     plt.ylabel('Loss MSE')
+    plt.yscale('log')  # Set the y-axis to a logarithmic scale
     plt.title('Learning Curves')
     plt.legend()
     plt.savefig(f'figures/{od}/learning_curves.png',format='png')
@@ -380,7 +449,7 @@ learning_curves(epochs_count_train, train_losses, epochs_count_val, val_losses)
 
 #%%
 def evaluate(model=model, test_dataloader=test_dataloader, device=device):
-    print('\nEVLUATION:')
+    print('\nEVALUATION:')
     # Evaluate the model
     model.eval()  # Set the model to evaluation mode
 
@@ -391,9 +460,10 @@ def evaluate(model=model, test_dataloader=test_dataloader, device=device):
 
     # Loop through the test set
     for step in range(len(test_dataloader)):
-        inputs= torch.tensor(test_dataloader.dataset.data[step], dtype=torch.float32)
-        labels= torch.tensor(test_dataloader.dataset.labels[step], dtype=torch.float32)
-        inputs= inputs.unsqueeze(0).unsqueeze(0)
+        sample = test_dataloader.dataset[step]
+        inputs = sample['data']
+        labels = sample['label']
+        inputs= inputs.unsqueeze(0)
         inputs, labels = inputs.to(device), labels.to(device)  # Move to device
         all_images.append(inputs.cpu().numpy()) # Transfer images to CPU
         with torch.no_grad():  # No need to calculate gradients
@@ -418,11 +488,10 @@ all_images, all_predictions, all_labels = evaluate()
 
 #%%
 # Display some predictions
-def visualize_predictions(all_predictions=all_predictions,test_dataloader=test_dataloader,num_samples=4,od=args.output_dir):
+def visualize_predictions(all_predictions=all_predictions,test_dataloader=test_dataloader,num_samples=4,od=args.output_dir,bs=args.batch_size):
     # Select random images
     if num_samples > len(all_predictions):
         num_samples = len(all_predictions)
-    indices = random.sample(range(len(all_predictions)), num_samples)
 
     fig, axs = plt.subplots(nrows=num_samples, ncols=2, figsize=(15, 5 * num_samples))
 
@@ -432,23 +501,34 @@ def visualize_predictions(all_predictions=all_predictions,test_dataloader=test_d
     else:
         for i in range(num_samples):
             # Sélectionner un indice aléatoire
-            idx = random.randint(0, len(test_dataloader.dataset) - 1)
+            idx = random.randint(0, int(len(test_dataloader.dataset)/bs) - 1)
 
             # Récupérer les données et les étiquettes à l'indice sélectionné
-            data = test_dataloader.dataset.data[idx]
-
-            label = test_dataloader.dataset.labels[idx]
+            sample = test_dataloader.dataset[idx]
+            data = sample['data']
+            label = sample['label']
             prediction = all_predictions[idx]
 
+            #convert the image from grid points into real units
+            dt = 0.00002*100 #dt * resampling
+            time_vector = np.arange(data.shape[1]) * dt
+            #print('time vector len:',len(time_vector))
+            nb_traces = data.shape[2]
+            #print('nb traces:',nb_traces)
+            dz = 0.25
+            #print('label shape:',label.shape)
+            depth_vector = np.arange(label.shape[0]) * dz
+
+
             # Afficher l'image dans la première colonne
-            axs[i, 0].imshow(data, aspect='auto', cmap='gray')
+            axs[i, 0].imshow(data[0], aspect='auto', cmap='gray',extent=[0,nb_traces,time_vector[-1],time_vector[0]])
             axs[i, 0].set_title(f'Shot Gather {idx}')
-            axs[i, 0].set_xlabel('Distance (m)')
-            axs[i, 0].set_ylabel('Time (sample)')
+            axs[i, 0].set_xlabel('Traces')
+            axs[i, 0].set_ylabel('Time (s)')
 
             # Afficher le label dans la deuxième colonne
-            axs[i, 1].plot(label, range(len(label)))
-            axs[i, 1].plot(prediction.reshape(-1), range(len(prediction)))
+            axs[i, 1].plot(label, depth_vector)
+            axs[i, 1].plot(prediction.reshape(-1), depth_vector)
             axs[i, 1].invert_yaxis()
             axs[i, 1].set_xlabel('Vs (m/s)')
             axs[i, 1].set_ylabel('Depth (m)')

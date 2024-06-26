@@ -17,14 +17,16 @@ import time
 from Utilities import *
 
 #define parser
-parser = argparse.ArgumentParser(description='ViT MASW')
+parser = argparse.ArgumentParser(description='ViT with Transfer Learning for MASW')
 
-parser.add_argument('--dataset_name','-data', type=str,default='Debug_simple_Dataset', required=False,
+parser.add_argument('--dataset_name','-data', type=str,default='TutorialDataset', required=False,
                     help='Name of the dataset to use, choose between \n Debug_simple_Dataset \n SimpleDataset \n IntermediateDataset')
 parser.add_argument('--nepochs','-ne', type=int, default=101, required=False,help='number of epochs for training')
-parser.add_argument('--lr','-lr', type=float, default=0.0005, required=False,help='learning rate')
+parser.add_argument('--lr','-lr', type=float, default=0.0001, required=False,help='learning rate')
 parser.add_argument('--batch_size','-bs', type=int, default=1, required=False,help='batch size')
 parser.add_argument('--output_dir','-od', type=str, default='ViT_TransferLearning_debug', required=False,help='output directory for figures')
+parser.add_argument('--data_augmentation','-aug', type=bool, default=False, required=False,help='data augmentation')
+parser.add_arguemnt('--decay','-dec', type=float, default=0, required=False,help='weight decay')
 
 
 
@@ -41,13 +43,13 @@ test_folder = glob.glob(f'{files_path}/test/*')
 
 setup_directories(name=args.output_dir)
 
-
+# Verify the dataset
+print('VERIFYING DATASET')
+bad_files = verify([train_folder,validate_folder,test_folder])
 class CustomDataset(Dataset):
     def __init__(self, folder, transform=None):
         self.data, self.labels = self.load_data_from_folder(folder)
-        self.transform = transform or transforms.Compose([
-            transforms.ToTensor()
-        ])
+        self.transform = transform #ici
 
     def load_data_from_folder(self, folder):
         data = []
@@ -56,6 +58,8 @@ class CustomDataset(Dataset):
         for file_path in folder:
             with h5.File(file_path, 'r') as h5file:
                 inputs = h5file['shotgather'][:]
+                #take second half only= Z component
+                inputs = inputs[:,int(inputs.shape[1]/2):]
                 labels_data = h5file['vsdepth'][:]
 
                 # print('data shape:',inputs.shape)
@@ -97,7 +101,7 @@ class CustomDataset(Dataset):
         sample = {'data': inputs, 'label': labels}
 
         if self.transform:
-            sample = self.transform(sample)
+            sample['data'] = self.transform(sample['data']) #ici
 
         return sample
 
@@ -106,7 +110,19 @@ def create_datasets(data_path, dataset_name):
     validate_folder = glob.glob(os.path.join(data_path, dataset_name, 'validate', '*'))
     test_folder = glob.glob(os.path.join(data_path, dataset_name, 'test', '*'))
 
-    train_dataset = CustomDataset(train_folder)
+    if args.data_augmentation:
+        # define augmentations
+        view_transform = transforms.Compose(
+            [
+                DeadTraces(),
+                MissingTraces(),
+                GaussianNoise(mean=0, std=0.1),
+            ]
+        )
+        train_dataset = CustomDataset(train_folder, transform=view_transform)
+    else:
+
+        train_dataset = CustomDataset(train_folder)
     validate_dataset = CustomDataset(validate_folder)
     test_dataset = CustomDataset(test_folder)
 
@@ -119,6 +135,8 @@ train_dataloader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle
 val_dataloader = DataLoader(validate_dataset, batch_size=args.batch_size, shuffle=True, collate_fn=None)
 test_dataloader = DataLoader(test_dataset, batch_size=args.batch_size, shuffle=True, collate_fn=None)
 
+
+
 #%%
 #Data processing
 # Verify if data is normalized
@@ -126,14 +144,19 @@ print('check a random image to verify if data is normalized:')
 print('min:',train_dataloader.dataset.data[0].min(),' max:', train_dataloader.dataset.data[0].max())
 
 def plot_random_samples(train_dataloader, num_samples=5,od=args.output_dir):
+
     fig, axs = plt.subplots(num_samples, 2, figsize=(15, 5 * num_samples))
 
     for i in range(num_samples):
         # Sélectionner un échantillon aléatoire
         idx = random.randint(0, len(train_dataloader.dataset) - 1)
-        image = train_dataloader.dataset.data[idx]
 
-        label= train_dataloader.dataset.labels[idx]
+        sample = train_dataloader.dataset[idx]
+        image = sample['data']
+        label = sample['label']
+
+        #image = train_dataloader.dataset.data[idx]
+        #label= train_dataloader.dataset.labels[idx]
 
         # Afficher l'image dans la première colonne
         axs[i, 0].imshow(image[0], aspect='auto', cmap='gray')
@@ -154,7 +177,7 @@ def plot_random_samples(train_dataloader, num_samples=5,od=args.output_dir):
 
 
 # Afficher des échantillons aléatoires
-plot_random_samples(train_dataloader, num_samples=5,)
+plot_random_samples(train_dataloader, num_samples=5)
 
 
 out_dim=len(train_dataloader.dataset.labels[0])
@@ -163,28 +186,35 @@ class PretrainedViT(nn.Module):
     def __init__(self, out_dim=out_dim, pretrained_model_name='google/vit-base-patch16-224-in21k'):
         super(PretrainedViT, self).__init__()
 
-        # Charger le modèle ViT pré-entraîné de Hugging Face
+        # Load the pretrained ViT model
         self.vit = ViTModel.from_pretrained(pretrained_model_name)
         emb_dim = self.vit.config.hidden_size  # Taille des embeddings du modèle pré-entraîné
 
-        # Geler les poids du modèle pré-entraîné
+        # Freeze the weights of the ViT model
         for param in self.vit.parameters():
             param.requires_grad = False
 
-        # Tête de régression
+        # Unfreeze the weights of the last layer of the ViT model
+        for param in self.vit.encoder.layer[-1].parameters():
+            param.requires_grad = True
+
+
         self.head = nn.Sequential(
-            nn.LayerNorm(emb_dim),  # Normalisation
-            nn.Linear(emb_dim, out_dim)
+            nn.LayerNorm(emb_dim),  # Normalization
+            nn.Linear(emb_dim, 256),  # Intermediar linear layer
+            nn.ReLU(),  # Activation non-linéaire
+            nn.Dropout(0.5),  # Dropout for regularization
+            nn.Linear(256, out_dim)  # Output layer
         )
 
     def forward(self, img):
-        # Passer les images dans le modèle pré-entraîné pour obtenir les embeddings
+        # Obtain embeddings
         outputs = self.vit(pixel_values=img)
 
-        # Extraire l'embedding du token [CLS]
+        # Extract the embedding of the [CLS] token
         cls_embedding = outputs.last_hidden_state[:, 0, :]
 
-        # Passer l'embedding du token [CLS] dans la tête de régression
+        # Use the embedding to make regression predictions
         output = self.head(cls_embedding)
 
         return output
@@ -193,7 +223,6 @@ class PretrainedViT(nn.Module):
 print('MODEL ARCHITECTURE:')
 model = PretrainedViT()
 print(model)
-
 
 def training(device=None,lr=0.0005,nepochs=101):
     print('\nTRAINING LOOP:')
@@ -209,8 +238,8 @@ def training(device=None,lr=0.0005,nepochs=101):
 
     # Initializations
     # Define optimizer and loss function
-    optimizer = optim.AdamW(model.parameters(), lr=lr)  # Optimizer for training, and learning rate
-    print('Optimizer: AdamW')
+    optimizer = optim.Adam(model.parameters(), lr=lr,weight_decay=args.decay)  # Optimizer for training, and learning rate
+    print(f'Optimizer:{optimizer} Learning rate: {lr}')
     criterion = nn.MSELoss()  # Loss function for regression
     print('Loss function: MSE')
     train_losses = []
@@ -224,15 +253,13 @@ def training(device=None,lr=0.0005,nepochs=101):
         epoch_losses = []
         model.train()
         for step in range(len(train_dataloader)):
-            inputs= torch.tensor(train_dataloader.dataset.data[step], dtype=torch.float32)
+            sample = train_dataloader.dataset[step]
+            inputs = sample['data']
+            labels = sample['label']
             inputs= inputs.unsqueeze(0)
-            labels = torch.tensor(train_dataloader.dataset.labels[step], dtype=torch.float32)
             inputs, labels = inputs.to(device), labels.to(device)
             optimizer.zero_grad()
             outputs = model(inputs)
-            #print('shape inputs',inputs.shape)
-            #print('shape outputs:',outputs.shape,'shape labels:' ,labels.shape)
-            # print('outputs:',outputs)
             loss = criterion(outputs.float(), labels.permute(1,0).float())
             loss.backward()
             optimizer.step()
@@ -243,16 +270,14 @@ def training(device=None,lr=0.0005,nepochs=101):
             train_losses.append(np.mean(epoch_losses));
             epochs_count_train.append(epoch)
             epoch_losses = []
-            # Something was strange when using this?
-            # model.eval()
             # Validation loop, every 5 epochs
             for step in range(len(val_dataloader)):
-                inputs = torch.tensor(val_dataloader.dataset.data[step], dtype=torch.float32)
-                labels= torch.tensor(val_dataloader.dataset.labels[step], dtype=torch.float32)
+                sample = val_dataloader.dataset[step]
+                inputs = sample['data']
+                labels = sample['label']
                 inputs= inputs.unsqueeze(0)
                 inputs, labels = inputs.to(device), labels.to(device)
                 outputs = model(inputs)
-                #print('shape outputs:',outputs.shape,'shape labels:' ,labels.shape)
                 loss = criterion(outputs, labels.permute(1,0))
                 epoch_losses.append(loss.item())
             val_losses.append(np.mean(epoch_losses));
@@ -262,9 +287,9 @@ def training(device=None,lr=0.0005,nepochs=101):
     return train_losses, val_losses, epochs_count_train, epochs_count_val, device,model
 
 # Training
-time0= time.time()
+time0= time.time() #initial time
 train_losses, val_losses, epochs_count_train, epochs_count_val,device,model=training(nepochs=args.nepochs,lr=args.lr)
-training_time=time.time()-time0
+training_time=time.time()-time0 #training time
 print('\nTraining time:',training_time)
 
 def learning_curves(epochs_count_train, train_losses, epochs_count_val, val_losses,od=args.output_dir):
@@ -273,6 +298,7 @@ def learning_curves(epochs_count_train, train_losses, epochs_count_val, val_loss
     plt.plot(epochs_count_val, val_losses, label='Validation Loss')
     plt.xlabel('Epoch')
     plt.ylabel('Loss MSE')
+    plt.yscale('log')  # Set the y-axis to a logarithmic scale
     plt.title('Learning Curves')
     plt.legend()
     plt.savefig(f'figures/{od}/learning_curves.png',format='png')
@@ -294,8 +320,11 @@ def evaluate(model=model, test_dataloader=test_dataloader, device=device):
 
     # Loop through the test set
     for step in range(len(test_dataloader)):
-        inputs= torch.tensor(test_dataloader.dataset.data[step], dtype=torch.float32)
-        labels= torch.tensor(test_dataloader.dataset.labels[step], dtype=torch.float32)
+        sample = test_dataloader.dataset[step]
+        inputs = sample['data']
+        labels = sample['label']
+        #inputs= torch.tensor(test_dataloader.dataset.data[step], dtype=torch.float32)
+        #labels= torch.tensor(test_dataloader.dataset.labels[step], dtype=torch.float32)
         inputs= inputs.unsqueeze(0)
         inputs, labels = inputs.to(device), labels.to(device)  # Move to device
         all_images.append(inputs.cpu().numpy()) # Transfer images to CPU
@@ -327,7 +356,6 @@ def visualize_predictions(all_predictions=all_predictions,test_dataloader=test_d
     # Select random images
     if num_samples > len(all_predictions):
         num_samples = len(all_predictions)
-    indices = random.sample(range(len(all_predictions)), num_samples)
 
     fig, axs = plt.subplots(nrows=num_samples, ncols=2, figsize=(15, 5 * num_samples))
 
@@ -336,28 +364,35 @@ def visualize_predictions(all_predictions=all_predictions,test_dataloader=test_d
 
     else:
         for i in range(num_samples):
-            # Sélectionner un indice aléatoire
-            idx = random.randint(0, len(test_dataloader.dataset) - 1)
 
-            # Récupérer les données et les étiquettes à l'indice sélectionné
-            data = test_dataloader.dataset.data[idx]
 
-            label = test_dataloader.dataset.labels[idx]
-            prediction = all_predictions[idx]
+            # data and labels for the i-th sample
+            sample = test_dataloader.dataset[i]
+            data = sample['data']
+            label = sample['label']
+
+            prediction = all_predictions[i]
+
+            # convert the image from grid points into real units
+            time_vector = np.linspace(0,1.5,data.shape[0])
+            nb_traces = 48
+            dz = 0.25
+            depth_vector = np.arange(label.shape[0]) * dz
+
 
             # Afficher l'image dans la première colonne
-            axs[i, 0].imshow(data[0], aspect='auto', cmap='gray')
-            axs[i, 0].set_title(f'Shot Gather {idx}')
+            axs[i, 0].imshow(data[0], aspect='auto', cmap='gray',extent=[0,nb_traces,time_vector[-1],time_vector[0]])
+            axs[i, 0].set_title(f'Shot Gather {i}')
             axs[i, 0].set_xlabel('Distance (m)')
             axs[i, 0].set_ylabel('Time (sample)')
 
             # Afficher le label dans la deuxième colonne
-            axs[i, 1].plot(label, range(len(label)))
-            axs[i, 1].plot(prediction.reshape(-1), range(len(prediction)))
+            axs[i, 1].plot(label, depth_vector)
+            axs[i, 1].plot(prediction.reshape(-1), depth_vector)
             axs[i, 1].invert_yaxis()
             axs[i, 1].set_xlabel('Vs (m/s)')
             axs[i, 1].set_ylabel('Depth (m)')
-            axs[i, 1].set_title(f'Vs Depth {idx}')
+            axs[i, 1].set_title(f'Vs Depth {i}')
 
     plt.tight_layout()
     plt.savefig(f'figures/{od}/predictionsVSlabels.png',format='png')
