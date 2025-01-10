@@ -1,38 +1,35 @@
 #%%
-# #packages importation
 import os
-import torch
-import matplotlib.pyplot as plt
-from random import random
-import random
-import numpy as np
-import torchvision.transforms as transforms
+os.environ["CUDA_VISIBLE_DEVICES"] = "2"
 from einops.layers.torch import Rearrange
-from torch import Tensor,nn
+from torch import Tensor
 from einops import repeat
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, Dataset
+from random import random
 import torch.optim as optim
-import glob
-import h5py as h5
-from torch.utils.data import Dataset
-import shutil
-from GeoFlow.GeoDataset import PytorchDataset
 import argparse
 import time
 from Utilities import *
+from data_augmentation import *
+import numpy as np
+
+
 
 #%%
 #define parser
 parser = argparse.ArgumentParser(description='ViT MASW')
 
-parser.add_argument('--dataset_name','-data', type=str,default='Debug_simple_Dataset', required=False,
-                    help='Name of the dataset to use, choose between \n Debug_simple_Dataset \n SimpleDataset \n IntermediateDataset')
-parser.add_argument('--nepochs','-ne', type=int, default=101, required=False,help='number of epochs for training')
+parser.add_argument('--dataset_name','-data', type=str,default='Dataset1Dsimple', required=False,
+                    help='Name of the dataset to use, choose between \n Dataset1Dbig \n Dataset1Dsmall \n TutorialDataset')
+parser.add_argument('--nepochs','-ne', type=int, default=1, required=False,help='number of epochs for training')
 parser.add_argument('--lr','-lr', type=float, default=0.0005, required=False,help='learning rate')
 parser.add_argument('--batch_size','-bs', type=int, default=1, required=False,help='batch size')
 parser.add_argument('--output_dir','-od', type=str, default='ViT_debug', required=False,help='output directory for figures')
 parser.add_argument('--data_augmentation','-aug', type=bool, default=False, required=False,help='data augmentation')
 parser.add_argument('--decay','-dec', type=float, default=0, required=False,help='weight decay')
+parser.add_argument('--loss','-lo', type=str, default='Jeff_Loss', required=False, help='loss function to use, there is MSE, NMSELoss, NMSERL1Loss')
+parser.add_argument('--num_heads','-nh', type=int, default=12, required=False, help='number of heads in the transformer')
+parser.add_argument('--num_layers','-nl', type=int, default=12, required=False, help='number of layers in the transformer')
 
 args = parser.parse_args()
 
@@ -125,7 +122,8 @@ def create_datasets(data_path, dataset_name):
             [
                 DeadTraces(),
                 MissingTraces(),
-                GaussianNoise(mean=0, std=0.1),
+                GaussianNoise(mean=0, std=0.05),
+                TraceShift2(shift_ratio=0.01, contiguous_ratio=0.2),
             ]
         )
         train_dataset = CustomDataset(train_folder,transform=view_transform)
@@ -287,8 +285,9 @@ class ViT(nn.Module):
     '''
     Vision Transformer class, composed of PatchEmbedding, PositionalEncoding, TransformerEncoder, and RegressionHead
     '''
-    def __init__(self, ch=1, img_height=img_height,img_width=img_width, emb_dim=36,
-                n_layers=12, out_dim=out_dim, dropout=0.1, heads=12):
+    #emb_dim was 36 for nh=12
+    def __init__(self, ch=1, img_height=img_height,img_width=img_width, emb_dim=int(args.num_heads * 3),
+                n_layers=args.num_layers, out_dim=out_dim, dropout=0.1, heads=args.num_heads):
         super(ViT, self).__init__()
 
         # Attributes
@@ -311,7 +310,6 @@ class ViT(nn.Module):
             torch.randn(1, num_patches + 1, emb_dim))
         self.cls_token = nn.Parameter(torch.rand(1, 1, emb_dim))
         self.dropout = nn.Dropout(dropout) # better performances ?
-
         # Transformer Encoder
         self.layers = nn.ModuleList([])
         for _ in range(n_layers):
@@ -351,79 +349,85 @@ print('MODEL ARCHITECTURE:')
 model = ViT()
 print(model)
 
-def training(device=None,lr=0.0001,nepochs=21):
+#print the amount of unfrozen parameters:
+unfrozen_parameters=sum(p.numel() for p in model.parameters() if p.requires_grad)
+print('Number of unfrozen parameters:',unfrozen_parameters)
+
+def training(device=None, lr=args.lr, nepochs=args.nepochs, early_stopping_patience=3,alpha=0.02,beta=0.1,l1param=0.05,vmaxparam=0.2):
     print('\nTRAINING LOOP:')
-    # GPU or CPU
     if device is None:
-        device = ("cuda" if torch.cuda.is_available() else "cpu")
-    if device == "cuda":
-        device = ("cuda" if torch.cuda.is_available() else "cpu")
-    elif device == "cpu":
-        device = device
+        device = "cuda" if torch.cuda.is_available() else "cpu"
     print('Device: ', device)
     model = ViT().to(device)
 
     # Initializations
-    # Define optimizer and loss function
-    #optimizer = optim.AdamW(model.parameters(), lr=lr)  # Optimizer for training, and learning rate
-    optimizer = optim.Adam(model.parameters(), lr=lr,weight_decay=args.decay)  # Optimizer for training, and learning rate
+    optimizer = optim.Adam(model.parameters(), lr=lr)  # Optimizer for training
     print(f'Optimizer:{optimizer} Learning rate: {lr}')
-    print('Learning rate:',lr)
-    criterion = nn.MSELoss()  # Loss function for regression
-    print('Loss function: MSE')
+
+    # Early stopping parameters
+    best_val_loss = float('inf')
+    epochs_without_improvement = 0
+
     train_losses = []
     val_losses = []
     epochs_count_train = []
     epochs_count_val = []
+
     print(f'Number of epochs: {nepochs}')
-    # Training loop
-    for epoch in range(nepochs): # Change this to train longer/shorter
-        #print('epoch:',epoch)
+    for epoch in range(nepochs):
         epoch_losses = []
         model.train()
         for step in range(len(train_dataloader)):
-            sample= train_dataloader.dataset[step]
+            sample = train_dataloader.dataset[step]
             inputs = sample['data']
             labels = sample['label']
-            #inputs= torch.tensor(train_dataloader.dataset.data[step], dtype=torch.float32)
-
-
-            inputs= inputs.unsqueeze(0)
-            #labels = torch.tensor(train_dataloader.dataset.labels[step], dtype=torch.float32)
+            inputs = inputs.unsqueeze(0)
             inputs, labels = inputs.to(device), labels.to(device)
             optimizer.zero_grad()
             outputs = model(inputs)
-            #print('shape inputs',inputs.shape)
-            #print('shape outputs:',outputs.shape,'shape labels:' ,labels.shape)
-            # print('outputs:',outputs)
-            loss = criterion(outputs.float(), labels.permute(1,0).float())
+            criterion = JeffLoss(alpha=alpha, beta=beta, l1=l1param, v_max=vmaxparam)
+            loss = criterion(outputs.float(), labels.permute(1, 0).float())
             loss.backward()
             optimizer.step()
             epoch_losses.append(loss.item())
-        # Print epoch loss, every 5 epochs
-        if epoch % 5 == 0:
-            print(f">>> Epoch {epoch} train loss: ", np.mean(epoch_losses))
-            train_losses.append(np.mean(epoch_losses));
-            epochs_count_train.append(epoch)
-            epoch_losses = []
-            # Something was strange when using this?
-            # model.eval()
-            # Validation loop, every 5 epochs
-            for step in range(len(val_dataloader)):
-                sample = val_dataloader.dataset[step]
-                inputs = sample['data']
-                labels = sample['label']
-                inputs= inputs.unsqueeze(0)
-                inputs, labels = inputs.to(device), labels.to(device)
-                outputs = model(inputs)
-                #print('shape outputs:',outputs.shape,'shape labels:' ,labels.shape)
-                loss = criterion(outputs, labels.permute(1,0))
-                epoch_losses.append(loss.item())
-            val_losses.append(np.mean(epoch_losses));
-            epochs_count_val.append(epoch)
-            print(f">>> Epoch {epoch} validation loss: ", np.mean(epoch_losses))
 
-    return train_losses, val_losses, epochs_count_train, epochs_count_val, device,model
+        if epoch % 5 == 0:
+            mean_train_loss = np.mean(epoch_losses)
+            print(f">>> Epoch {epoch} train loss: ", mean_train_loss)
+            train_losses.append(mean_train_loss)
+            epochs_count_train.append(epoch)
+
+            # Validation loop
+            model.eval()
+            val_losses_epoch = []
+            with torch.no_grad():
+                for step in range(len(val_dataloader)):
+                    sample = val_dataloader.dataset[step]
+                    inputs = sample['data']
+                    labels = sample['label']
+                    inputs = inputs.unsqueeze(0)
+                    inputs, labels = inputs.to(device), labels.to(device)
+                    outputs = model(inputs)
+                    loss = criterion(outputs.float(), labels.permute(1, 0).float())
+                    val_losses_epoch.append(loss.item())
+
+            mean_val_loss = np.mean(val_losses_epoch)
+            val_losses.append(mean_val_loss)
+            epochs_count_val.append(epoch)
+            print(f">>> Epoch {epoch} validation loss: ", mean_val_loss)
+
+            # Early stopping check
+            if mean_val_loss < best_val_loss:
+                best_val_loss = mean_val_loss
+                epochs_without_improvement = 0
+                # Save the best model here if needed
+            else:
+                epochs_without_improvement += 1
+                if epochs_without_improvement >= early_stopping_patience:
+                    print(f"Early stopping at epoch {epoch}")
+                    break
+
+    return train_losses, val_losses, epochs_count_train, epochs_count_val, device, model
 
 # Training
 time0= time.time()
@@ -448,10 +452,12 @@ def learning_curves(epochs_count_train, train_losses, epochs_count_val, val_loss
 learning_curves(epochs_count_train, train_losses, epochs_count_val, val_losses)
 
 #%%
-def evaluate(model=model, test_dataloader=test_dataloader, device=device):
+def evaluate(model=model, test_dataloader=test_dataloader, device=device,alpha=0.02,beta=0.1,l1param=0.05,vmaxparam=0.2):
     print('\nEVALUATION:')
     # Evaluate the model
     model.eval()  # Set the model to evaluation mode
+    #loss
+    criterion = JeffLoss(alpha=alpha, beta=beta, l1=l1param, v_max=vmaxparam)
 
     # Initializations
     all_images = []
@@ -463,11 +469,15 @@ def evaluate(model=model, test_dataloader=test_dataloader, device=device):
         sample = test_dataloader.dataset[step]
         inputs = sample['data']
         labels = sample['label']
+        #inputs= torch.tensor(test_dataloader.dataset.data[step], dtype=torch.float32)
+        #labels= torch.tensor(test_dataloader.dataset.labels[step], dtype=torch.float32)
         inputs= inputs.unsqueeze(0)
         inputs, labels = inputs.to(device), labels.to(device)  # Move to device
         all_images.append(inputs.cpu().numpy()) # Transfer images to CPU
         with torch.no_grad():  # No need to calculate gradients
             outputs = model(inputs)  # Make predictions
+            #calculate error:
+            loss = criterion(outputs.float(), labels.permute(1,0).float())
         all_predictions.append(outputs.detach().cpu().numpy())  # Transfer predictions to CPU
         all_labels.append(labels.cpu().numpy().T)  # Transfer labels to CPU
 
@@ -476,15 +486,16 @@ def evaluate(model=model, test_dataloader=test_dataloader, device=device):
     all_predictions = np.concatenate(all_predictions, axis=0)
     all_labels = np.concatenate(all_labels, axis=0)
 
-    # Calculate the mean squared error
-    mse = np.mean((all_predictions - all_labels) ** 2)
+    #mean loss:
+    loss_np = loss.cpu().detach().numpy()
+    mean_loss = np.mean(loss_np)
 
     # Display the mean squared error
-    print("Mean Squared Error on Test Set:", mse)
-    return all_images, all_predictions, all_labels
+    print("Loss on Test Set:", mean_loss)
+    return all_images, all_predictions, all_labels,mean_loss
 
 # Evaluate the model
-all_images, all_predictions, all_labels = evaluate()
+all_images, all_predictions, all_labels,mean_loss = evaluate()
 
 #%%
 # Display some predictions
@@ -542,3 +553,12 @@ def visualize_predictions(all_predictions=all_predictions,test_dataloader=test_d
 
 # Afficher quelques images avec leurs étiquettes et prédictions
 visualize_predictions(num_samples=5)
+
+#save runs infos
+#display on a signgle image all informations about the current model
+main_path= os.path.abspath(__file__)
+display_run_info(model=model,od=args.output_dir,args=args,metrics=mean_loss,training_time=training_time,main_path=main_path,best_params=None,nb_param=unfrozen_parameters)
+
+
+#save the model parameters
+torch.save(model.state_dict(), f'figures/{args.output_dir}/model.pth')
