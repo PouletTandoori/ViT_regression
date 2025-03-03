@@ -3,11 +3,11 @@ import math
 import numpy as np
 import torch
 
-def acquisition_parameters(dataset_name,max_c=3.5):
+def acquisition_parameters(dataset_name,max_c=3.5,display=False):
     '''
     define some parameters
     '''
-    print('Dataset:', dataset_name)
+    #print('Dataset:', dataset_name)
     if dataset_name == 'Dataset1Dsmall' or dataset_name == 'Dataset1Dbig' or dataset_name == 'TutorialDataset':
         # define some parameters
         fmax = 35  # maximum frequency
@@ -47,6 +47,26 @@ def acquisition_parameters(dataset_name,max_c=3.5):
         x = rec_pos - src_pos[0]  # offsets
         c = np.logspace(2, np.log10(max_c), num=224)  # phase velocities
 
+    elif dataset_name == 'Halton_debug' or dataset_name == 'For_inversion_example' or dataset_name == 'Halton_Dataset' :
+
+        fmax = 35  # maximum frequency
+        dt = 0.00007  * 100  # timestep * resampling
+        src_pos = [8.]  # source position
+
+        rec_pos = np.array([ 40.,  41.,  42.,  43.,  44.,  45.,  46.,  47.,  48.,  49.,  50.,  51.,  52.,  53.,
+            54.,  55.,  56.,  57.,  58.,  59.,  60.,  61.,  62.,  63.,  64.,  65.,  66.,  67.,
+            68.,  69.,  70.,  71.,  72.,  73.,  74.,  75. , 76.,  77.,  78.,  79.,  80.,  81.,
+            82.,  83.,  84.,  85.,  86.,  87. , 88.,  89.,  90.,  91.,  92.,  93.,  94.,  95.,
+            96.,  97. , 98. , 99. ,100., 101., 102., 103. ,104., 105., 106., 107., 108., 109.,
+            110., 111., 112., 113., 114., 115., 116., 117., 118., 119., 120., 121., 122., 123.,
+            124., 125., 126., 127., 128., 129. ,130. ,131. ,132. ,133. ,134. ,135.])  # receivers positions
+        dg = np.abs(rec_pos[0] - rec_pos[1])  # receiver spacing
+        off0 = np.abs(rec_pos[0] - src_pos[0])  # minimum offset
+        off1 = np.abs(rec_pos[-1] - rec_pos[0])  # maximum offset
+        ng = rec_pos.shape[-1]  # number of receivers
+        offmin, offmax = np.min([off0, off1]), np.max([off0, off1])
+        x = rec_pos - src_pos[0]  # offsets
+        c = np.logspace(1.5, max_c, num=224)  # phase velocities
 
     else:
         print('Be careful the parameters for generating the dispersion images may be wrong !')
@@ -64,6 +84,9 @@ def acquisition_parameters(dataset_name,max_c=3.5):
         offmin, offmax = np.min([off0, off1]), np.max([off0, off1])
         x = rec_pos - src_pos[0]  # offsets
         c = np.logspace(1.5, 3.5, num=224)  # phase velocities
+
+    if display == True:
+        print('fmax:', fmax, '\ndt:', dt, '\nsrc_pos:', src_pos, '\nrec_pos:', rec_pos, '\ndg:', dg, '\noff0:', off0, '\noff1:', off1, '\nng:', ng, '\noffmin:', offmin, '\noffmax:', offmax, '\nx:', x, '\nc:', c)
 
     return fmax, dt, src_pos, rec_pos, dg, off0, off1, ng, offmin, offmax, x, c
 
@@ -87,6 +110,7 @@ def phase_shift_sum_base(d, f, x, c, adjoint=False):
     nd = tf.rank(d)
     inds = tf.concat([tf.ones(nd-1, dtype=tf.int32), [-1]], axis=0)
     f = tf.cast(tf.reshape(f, inds), d.dtype)
+    #print('f2',f)
 
     c = tf.cast(c, d.dtype)
     nc = c.shape[-1]
@@ -150,6 +174,7 @@ def linear_radon_freq(d, dt, x, c, fmax=None, norm=False, epsilon=0.001):
         raise ValueError("fmax=%f is greater than nyquist=%f"
                          % (fmax, 0.5 / dt))
     f = tf.range(fmax, delta=1.00 / (nt*dt))
+    #print('f:', f)
     nf = f.shape[-1]
 
     d_fft = d_fft[..., :nf]
@@ -169,6 +194,8 @@ def dispersion(d, dt, x, c, fmax=None,epsilon=0.001):
     :param epsilon:
     :return:
     '''
+    #print('d:', d.shape)
+    #print('d0*dt:', d.shape[1]*dt)
     return tf.abs(linear_radon_freq(d, dt, x, c, fmax=fmax, norm=True,epsilon=epsilon))
 
 def prepare_disp_for_NN(disp):
@@ -176,6 +203,7 @@ def prepare_disp_for_NN(disp):
     disp = (disp - np.min(disp)) / (np.max(disp) - np.min(disp))
     #store shape:
     shape0,shape1= np.shape(disp)
+    print('disp shape:', np.shape(disp))
     # add padding to the disp to reach 224,224
     disp = np.pad(disp, ((0, 224 - disp.shape[0]), (0, 224 - disp.shape[1])), 'constant', constant_values=(0, 0))
     #print('disp after reshape shape:', np.shape(disp))
@@ -189,3 +217,57 @@ def prepare_disp_for_NN(disp):
     #print('disp shape tensor:', np.shape(disp))
 
     return disp,shape0,shape1
+
+# test the programm for Halton_debug dataset (if main ....)
+if __name__ == '__main__':
+    # Use PytorchDataset to load the data and directly create dataloaders with shot gathers and Vs profiles
+    from PytorchDataset import create_dataloaders
+
+    # defines some variables:
+    data_path = '/home/rbertille/data/pycharm/ViT_project/pycharm_ViT/DatasetGeneration/Datasets/'
+    dataset_name = 'Halton_debug'
+
+    # data_path = '/home/rbertille/data/pycharm/ViT_project/pycharm_Geoflow/GeoFlow/Tutorial/Datasets/'
+    # dataset_name = 'Dataset1Dsimple'
+
+    # create pytorch dataloaders
+    train_dataloader, val_dataloader, test_dataloader = create_dataloaders(
+        data_path=data_path,
+        dataset_name=dataset_name,
+        batch_size=1,
+        use_dispersion=True,
+        data_augmentation=False
+    )
+
+    # select only 1 exemle1 for this exercice:
+    train_dataloader.dataset.data = train_dataloader.dataset.data[:1]
+    # and associated labels:
+    train_dataloader.dataset.labels = train_dataloader.dataset.labels[:1]
+    # define some parameters
+    fmax, dt, src_pos, rec_pos, dg, off0, off1, ng, offmin, offmax, x, c = acquisition_parameters('Halton_debug', max_c=3.5)
+    print('fmax:', fmax, 'dt:', dt, 'src_pos:', src_pos, 'rec_pos:', rec_pos, 'dg:', dg, 'off0:', off0, 'off1:', off1, 'ng:', ng, 'offmin:', offmin, 'offmax:', offmax, 'x:', x, 'c:', c)
+
+    from matplotlib import pyplot as plt
+    # Then create dispersion images:
+    for i in range(len(train_dataloader)):
+        sample = train_dataloader.dataset[i]
+        inputs = sample['data']
+        # create dispersion images:
+        disp = dispersion(inputs[0].T, dt, x, c, epsilon=1e-6, fmax=fmax).numpy().T
+        disp, shape1, shape2 = prepare_disp_for_NN(disp)
+        # plot them:
+        plt.figure()
+        plt.imshow(disp[0][:shape1,:shape2], aspect='auto', cmap='jet')
+        xticks_positions = np.linspace(0, disp.shape[2] - 1, 5).astype(int)
+        xticks_labels = np.round(np.linspace(np.min(c), np.max(c), 5)).astype(int)
+        plt.xticks(xticks_positions, xticks_labels)
+        plt.xlabel('Velocity (m/s)')
+        plt.ylabel('Frequency (Hz)')
+        plt.colorbar()
+        plt.title('Dispersion image')
+        plt.show()
+        # stop after 1 example:
+        if i == 1:
+            break
+
+

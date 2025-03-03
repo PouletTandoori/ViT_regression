@@ -17,6 +17,7 @@ from torchinfo import summary
 from transformers import ViTModel
 import torchvision.models as models
 from NN_architectures import *
+from scipy.sparse.linalg import lsqr
 
 def PrepareClasses(train_dataloader=None, val_dataloader=None, test_dataloader=None,multiplier=20):
     """
@@ -1686,22 +1687,35 @@ def normalize_labels(train_dataloader, val_dataloader, test_dataloader):
             - The maximum label value found across all datasets.
     """
     # Calculate the maximum label value across all datasets
-    max_label = 0
+    max_labelVP = 0
     for dataset in [train_dataloader.dataset, val_dataloader.dataset, test_dataloader.dataset]:
-        for i in range(len(dataset.labels)):
-            max_label = max(max_label, dataset.labels[i].max())
+        for i in range(len(dataset.labelsVP)):
+            max_labelVP = max(max_labelVP, dataset.labelsVP[i].max())
 
-    print('Max label:', max_label)
+    print('Max label VP:', max_labelVP)
 
     # Normalize the labels by dividing them by max_label
     for dataset in [train_dataloader.dataset, val_dataloader.dataset, test_dataloader.dataset]:
-        for i in range(len(dataset.labels)):
-            dataset.labels[i] = dataset.labels[i] / max_label
+        for i in range(len(dataset.labelsVP)):
+            dataset.labelsVP[i] = dataset.labelsVP[i] / max_labelVP
 
-    return train_dataloader, val_dataloader, test_dataloader, max_label
+    #do the same for VS:
+    max_labelVS = 0
+    for dataset in [train_dataloader.dataset, val_dataloader.dataset, test_dataloader.dataset]:
+        for i in range(len(dataset.labelsVS)):
+            max_labelVS = max(max_labelVS, dataset.labelsVS[i].max())
+
+    print('Max label VS:', max_labelVS)
+
+    # Normalize the labels by dividing them by max_label
+    for dataset in [train_dataloader.dataset, val_dataloader.dataset, test_dataloader.dataset]:
+        for i in range(len(dataset.labelsVS)):
+            dataset.labelsVS[i] = dataset.labelsVS[i] / max_labelVS
+
+    return train_dataloader, val_dataloader, test_dataloader, max_labelVP, max_labelVS
 
 
-def plot_random_samples(train_dataloader=None, num_samples=5,od='None',max_label=None):
+def plot_random_samples(train_dataloader=None, num_samples=5,od='None',max_labelVS=None,id='None'):
     print('Display some random samples from the dataloaders')
     #verify od is not None:
     if od=='None':
@@ -1710,37 +1724,188 @@ def plot_random_samples(train_dataloader=None, num_samples=5,od='None',max_label
     if train_dataloader==None:
         raise ValueError('No dataloader provided, cannot plot samples')
     # metion max_label as well:
-    if max_label==None:
+    if max_labelVS==None:
         print('No maximal value provided for the label, using 6000 m/s as default value')
-        max_label=6000
+        max_labelVS=2000
 
     fig, axs = plt.subplots(num_samples, 2, figsize=(15, 5 * num_samples))
 
-    for i in range(num_samples):
-        # Sélectionner un échantillon aléatoire
-        idx = random.randint(0, len(train_dataloader.dataset) - 1)
+    #if i == 1 make only one plot
+    if num_samples == 1:
+        if id != 'None':
+            idx = id
+        else:
+            # Sélectionner un échantillon aléatoire
+            idx = random.randint(0, len(train_dataloader.dataset) - 1)
 
         sample = train_dataloader.dataset[idx]
         image = sample['data']
-        label = sample['label']
+        print('[random samples] shape image:',np.shape(image))
+        labelVS = sample['label_VS']
 
-        #image = train_dataloader.dataset.data[idx]
-        #label= train_dataloader.dataset.labels[idx]
+
+        # image = train_dataloader.dataset.data[idx]
+        # label= train_dataloader.dataset.labels[idx]
 
         # Afficher l'image dans la première colonne
-        axs[i, 0].imshow(image[0], aspect='auto', cmap='gray')
-        axs[i, 0].set_title(f'Shot Gather {i + 1}')
-        axs[i, 0].set_xlabel('Distance (m)')
-        axs[i, 0].set_ylabel('Time (sample)')
+        axs[0].imshow(image[0], aspect='auto', cmap='gray')
+        axs[0].set_title(f'Shot Gather')
+        axs[0].set_xlabel('Distance (m)')
+        axs[0].set_ylabel('Time (sample)')
 
         # Afficher le label dans la deuxième colonne
-        axs[i, 1].plot(label*max_label, range(len(label)))
-        axs[i, 1].invert_yaxis()
-        axs[i, 1].set_xlabel('Vs (m/s)')
-        axs[i, 1].set_ylabel('Depth (m)')
-        axs[i, 1].set_title(f'Vs Depth {i + 1}')
+        axs[1].plot(labelVS * max_labelVS, range(len(labelVS)))
+        axs[1].invert_yaxis()
+        axs[1].set_xlabel('Vs (m/s)')
+        # set x lim as max_labelVS:
+        axs[1].set_xlim(0,max_labelVS)
+        axs[1].set_ylabel('Depth (m)')
+        axs[1].set_title(f'Vs Depth')
+
+    else:
+        for i in range(num_samples):
+            # Sélectionner un échantillon aléatoire
+            idx = random.randint(0, len(train_dataloader.dataset) - 1)
+
+            sample = train_dataloader.dataset[idx]
+            image = sample['data']
+            print('[random samples] shape image:', np.shape(image))
+            labelVS = sample['label_VS']
+
+            # image = train_dataloader.dataset.data[idx]
+            # label= train_dataloader.dataset.labels[idx]
+
+            # Afficher l'image dans la première colonne
+            axs[i, 0].imshow(image[0], aspect='auto', cmap='gray')
+            axs[i, 0].set_title(f'Shot Gather {i + 1}')
+            axs[i, 0].set_xlabel('Distance (m)')
+            axs[i, 0].set_ylabel('Time (sample)')
+
+            # Afficher le label dans la deuxième colonne
+            axs[i, 1].plot(labelVS * max_labelVS, range(len(labelVS)))
+            axs[i, 1].invert_yaxis()
+            axs[i, 1].set_xlabel('Vs (m/s)')
+            # set x lim as max_labelVS:
+            axs[i,1].set_xlim(0, max_labelVS)
+            axs[i, 1].set_ylabel('Depth (m)')
+            axs[i, 1].set_title(f'Vs Depth {i + 1}')
 
     plt.tight_layout()
-    if od != 'None':
+    if od == None:
+        plt.show()
+        plt.close()
+    else:
         plt.savefig(f'figures/{od}/random_samples.pdf', format='pdf',dpi=300)
     plt.close()
+
+
+def print_matrix(array, pretext=''):
+    from IPython.display import display, Math
+    if array.dtype == 'int64':
+        fstring = ' %d '
+    else:
+        fstring = ' %.3f '
+
+    data = ''
+    for line in array:
+        if not hasattr(line, '__len__'):
+            data += fstring%line + r' \\'
+            continue
+        if len(line) == 1:
+            data += fstring%line + r'& \\\n'
+            continue
+        for element in line:
+            data += fstring%element + r'&'
+        data = data[:-1] + r'\\' + '\n'
+    display(Math(pretext+'\\begin{bmatrix} \n%s\end{bmatrix}'%data))
+
+
+import numpy as np
+from scipy.sparse.linalg import lsqr
+
+def lm(fun, p0, tol, maxiter, maxinner=None):
+    """
+    Minimize a nonlinear least-squares problem using the Levenberg-Marquardt algorithm.
+
+    Parameters
+    ----------
+    fun : callable
+        Function returning the residual vector F and the Jacobian matrix J.
+        Signature: F, J = fun(p), where:
+            - F is the residual vector (n,).
+            - J is the Jacobian matrix (n, m) or a LinearOperator.
+    p0 : array-like
+        Initial guess for the parameters (m,).
+    tol : float
+        Stopping tolerance. The algorithm stops if the gradient norm, function change,
+        or parameter change is below this threshold.
+    maxiter : int
+        Maximum number of iterations allowed.
+    maxinner : int, optional
+        Maximum number of iterations for the inner loop (lsqr). Default: None.
+
+    Returns
+    -------
+    pstar : array-like
+        Best solution found (m,).
+    k : int
+        Number of iterations performed.
+    """
+
+    # Validate inputs
+    p0 = np.asarray(p0)
+    if p0.ndim != 1:
+        raise ValueError("p0 must be a 1D array.")
+    if not callable(fun):
+        raise ValueError("fun must be a callable function.")
+
+    # Initialize p and oldp
+    p = p0.reshape((-1, 1))
+    n = p0.shape[0]
+    Fp, J = fun(p)
+    fp = np.linalg.norm(Fp) ** 2
+    oldp = p0 * 2
+    oldfp = fp * 2
+
+    # Initialize lambda
+    lam = 0.0001
+
+    # Main loop
+    k = 0
+    while k <= maxiter:
+        # Compute rhs = -J' * Fp
+        rhs = -J.T @ Fp
+
+        # Check termination criteria
+        if ((np.linalg.norm(rhs) < np.sqrt(tol) * (1 + np.abs(fp))) and
+                (np.abs(oldfp - fp) < tol * (1 + np.abs(fp))) and
+                (np.linalg.norm(oldp - p) < np.sqrt(tol) * (1 + np.linalg.norm(p)))):
+            return p.flatten(), k
+
+        # Solve the least-squares problem
+        s = lsqr(J, -Fp, damp=np.sqrt(lam), iter_lim=maxinner)[0].reshape((-1, 1))
+
+        # Compute the new residual and Jacobian
+        Fpnew, Jnew = fun(p + s)
+        fpnew = np.linalg.norm(Fpnew) ** 2
+
+        # Update parameters if the solution improves
+        if fpnew < fp:
+            oldp = p
+            oldfp = fp
+            p = p + s
+            fp = fpnew
+            Fp = Fpnew
+            J = Jnew
+            lam /= 2
+            lam = max(lam, 1.0e-12)  # Prevent lambda from becoming too small
+        else:
+            # Increase lambda and try again
+            lam *= 2.5
+            lam = min(lam, 1.0e16)  # Prevent lambda from becoming too large
+
+        # Update iteration count
+        k += 1
+
+    # Return if maxiter is exceeded
+    return p.flatten(), k

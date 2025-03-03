@@ -4,6 +4,9 @@ import torch.nn as nn
 from torchvision import models
 import timm
 from transformers import ViTModel
+from peft import LoraConfig, get_peft_model
+torch.backends.cudnn.benchmark = True
+
 
 class PretrainedResNet18(nn.Module):
     def __init__(self, out_dim=200):
@@ -187,6 +190,100 @@ class PretrainedPVTv2(nn.Module):
         output = self.head(x)
 
         return output
+
+class PretrainedPVTv2QLoRA(nn.Module):
+    def __init__(self, out_dim=200, pretrained_model_name='pvt_v2_b2'):
+        super(PretrainedPVTv2QLoRA, self).__init__()
+
+        # Conv Adapter pour modifier la taille des images d'entrée
+        self.conv_adapter = nn.Sequential(
+            nn.Conv2d(3, 64, kernel_size=3, stride=1, padding=1),
+            nn.BatchNorm2d(64),
+            nn.ReLU(),
+            nn.MaxPool2d(kernel_size=2, stride=2),
+
+            nn.Conv2d(64, 128, kernel_size=3, stride=1, padding=1),
+            nn.BatchNorm2d(128),
+            nn.ReLU(),
+            nn.MaxPool2d(kernel_size=2, stride=2),
+
+            nn.Conv2d(128, 256, kernel_size=3, stride=1, padding=1),
+            nn.BatchNorm2d(256),
+            nn.ReLU(),
+            nn.MaxPool2d(kernel_size=2, stride=2),
+
+            nn.Conv2d(256, 3, kernel_size=3, stride=1, padding=1),
+            nn.BatchNorm2d(3),
+            nn.ReLU(),
+
+            nn.Upsample(size=(224, 224), mode="bilinear")
+        )
+
+        # Charger le modèle PVTv2
+        self.pvt = timm.create_model(pretrained_model_name, pretrained=True)
+
+        # Appliquer la quantification manuelle en 4 bits
+        self.pvt = self.apply_quantization(self.pvt)
+
+        # Ajouter LoRA sur la dernière couche du PVTv2
+        lora_config = LoraConfig(
+            r=16,  # Taille du rank de LoRA
+            lora_alpha=32,  # Échelle de LoRA
+            lora_dropout=0.1,  # Dropout pour LoRA
+            bias="none",  # Pas de biais
+            target_modules=["head"],  # Appliquer LoRA sur la tête du modèle
+            task_type="FEATURE_EXTRACTION"
+        )
+
+        # Appliquer LoRA au modèle PVTv2
+        self.pvt = get_peft_model(self.pvt, lora_config)
+
+        emb_dim = self.pvt.num_features  # Taille des embeddings
+
+        # Global Pooling + Head personnalisée
+        self.global_pool = nn.AdaptiveAvgPool2d((1, 1))
+
+        self.head = nn.Sequential(
+            nn.LayerNorm(emb_dim),
+            nn.Linear(emb_dim, 256),
+            nn.ReLU(),
+            nn.Dropout(0.5),
+            nn.Linear(256, out_dim)
+        )
+
+    def apply_quantization(self, model):
+        """
+        Applique la quantification 4 bits manuellement sur les poids du modèle.
+        """
+        with torch.no_grad():
+            for param in model.parameters():
+                if len(param.shape) > 1:  # Quantifier uniquement les poids
+                    # Normaliser les poids pour la quantification en 4 bits
+                    min_val = param.min()
+                    max_val = param.max()
+                    scale = 15.0  # Utiliser 4 bits : 15 pour une échelle de 0 à 15
+                    quantized = torch.round((param - min_val) / (max_val - min_val) * scale)
+                    param.data = (quantized / scale) * (max_val - min_val) + min_val
+        return model
+
+    def forward(self, img):
+        if img.shape[-2:] == (750, 96):
+            img = self.conv_adapter(img)
+
+        # Passage dans le modèle PVTv2
+        x = self.pvt.forward_features(img)
+
+        # Global pooling
+        x = self.global_pool(x)
+
+        # Flatten pour transformer en vecteur
+        x = torch.flatten(x, start_dim=1)
+
+        # Passage dans la tête finale
+        output = self.head(x)
+
+        return output
+
 
 class PretrainedViT(nn.Module):
     def __init__(self, out_dim=200, pretrained_model_name='google/vit-base-patch32-224-in21k'):

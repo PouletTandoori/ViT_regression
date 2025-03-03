@@ -100,89 +100,24 @@ print(model)
 unfrozen_parameters=sum(p.numel() for p in model.parameters() if p.requires_grad)
 print('Number of unfrozen parameters:',unfrozen_parameters)
 
-#if GS = True
-if args.GS == True:
-    # Training
-    # Définir la grille des paramètres tel que (1- alpha -beta toujours supérieur ou égal à 0.1):
-    alphas=[0,0.1,0.2,0.3,0.4,0.5,0.6,0.7,0.8,0.9]
-    betas=[0,0.1,0.2,0.3,0.4,0.5,0.6,0.7,0.8,0.9]
-
-
-    param_grid = {
-        'alpha': alphas,
-        'beta': betas
-    }
-
-    # Grid search
-    best_params = None
-    best_val_loss = float('inf')
-    best_time = 0
-    final_val_losses = []
-    final_train_losses = []
-    final_epochs_count_train = 0
-    final_epochs_count_val = 0
-
-    # init for total time
-    t00 = time.time()
-
-    for params in ParameterGrid(param_grid):
-        print(f"Testing parameters: {params}")
-        if params['alpha'] + params['beta'] + 0.1 > 1:
-            print('Parameters not valid, sum must be less than 1')
-            #test anothers parameters directly
-            continue
-        alpha = params['alpha']
-        beta = params['beta']
-
-        # Appel à la fonction de formation
-        t0 = time.time()
-        train_losses, val_losses, epochs_count_train, epochs_count_val, device, model = training(
+t0 = time.time()
+train_losses, val_losses, epochs_count_train, epochs_count_val, device, model = training(
             device="cuda" if torch.cuda.is_available() else "cpu",
             lr=args.lr,
             nepochs=args.nepochs,
-            alpha=alpha,
-            beta=beta
+            alpha=args.alpha,
+            train_dataloader=train_dataloader,
+            val_dataloader=val_dataloader,
+            max_label=max_label,
+            model=model,
+            dispersion_arg=args.dispersion_image
         )
-        training_time = time.time() - t0
-
-        # Évaluer la perte de validation et mettre à jour les meilleurs paramètres si nécessaire
-        final_val_loss = val_losses[-1] if val_losses else float('inf')
-        if final_val_loss < best_val_loss:
-            best_val_loss = final_val_loss
-            final_val_losses = val_losses
-            final_train_losses = train_losses
-            best_params = params
-            best_time = training_time
-            final_epochs_count_train = epochs_count_train
-            final_epochs_count_val = epochs_count_val
-
-    # total time
-    total_time = time.time() - t00
-    print(f"Best parameters: {best_params} with validation loss: {best_val_loss}")
-    print('\nTraining time best model:', training_time)
-    print('\nTotal Grid search time:', total_time)
-
-else:
-    #use default loss parameters
-    # Training
-    t0 = time.time()
-    train_losses, val_losses, epochs_count_train, epochs_count_val, device, model = training(
-        device="cuda" if torch.cuda.is_available() else "cpu",
-        lr=args.lr,
-        nepochs=args.nepochs,
-        alpha=args.alpha,
-        train_dataloader=train_dataloader,
-        val_dataloader=val_dataloader,
-        max_label=max_label,
-        model=model,
-        dispersion_arg=args.dispersion_image
-    )
-    best_time = time.time() - t0
-    best_params = { 'l1': args.alpha, 'beta': args.blocky_inversion}
-    final_val_losses = val_losses
-    final_train_losses = train_losses
-    final_epochs_count_train = epochs_count_train
-    final_epochs_count_val = epochs_count_val
+best_time = time.time() - t0
+best_params = {'alpha': 0.00, 'beta': 0.0, 'l1': args.alpha, 'v_max': 0.0}
+final_val_losses = val_losses
+final_train_losses = train_losses
+final_epochs_count_train = epochs_count_train
+final_epochs_count_val = epochs_count_val
 
 # Display learning curves
 learning_curves(final_epochs_count_train, final_train_losses, final_epochs_count_val, final_val_losses,args.output_dir)

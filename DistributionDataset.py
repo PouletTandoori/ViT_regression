@@ -15,19 +15,30 @@ We will create several figures, with maximum 6 shot gathers per figure.
 '''
 # Import libraries -----------------------------------------------------------
 import argparse
+#use GPU 3:
+import os
+os.environ["CUDA_VISIBLE_DEVICES"] = "3"
+
+import numpy as np
+
 from Utilities import *
 from torch.utils.data import Dataset
 from PhaseShiftMethod import *
+from PytorchDataset import CustomDataset
 
 # Define the arguments -------------------------------------------------------
 parser = argparse.ArgumentParser(description='Dataset distribution analysis')
-parser.add_argument('--dataset_name','-data', type=str,default='Dataset1Dhuge_96tr', required=False,
+parser.add_argument('--dataset_name','-data', type=str,default='Halton_debug', required=False,
                     help='Name of the dataset to use, choose between \n Dataset1Dsmall \n Dataset1Dbig \n TutorialDataset')
 args = parser.parse_args()
 
+
 # Set correct input and output paths ------------------------------------------
-data_path = '/home/rbertille/data/pycharm/ViT_project/pycharm_Geoflow/GeoFlow/Tutorial/Datasets/'
 dataset_name = args.dataset_name
+if dataset_name == 'Halton_debug' or dataset_name == 'Halton_Dataset':
+    data_path ='/home/rbertille/data/pycharm/ViT_project/pycharm_ViT/DatasetGeneration/Datasets/'
+else:
+    data_path = '/home/rbertille/data/pycharm/ViT_project/pycharm_Geoflow/GeoFlow/Tutorial/Datasets/'
 files_path = os.path.join(data_path, dataset_name)
 
 train_folder = glob.glob(f'{files_path}/train/*')
@@ -38,54 +49,6 @@ setup_directories(name=dataset_name)
 
 # Create the dataset ----------------------------------------------------------
 print('\nLOAD THE DATA')
-class CustomDataset(Dataset):
-    def __init__(self, folder, transform=None):
-        self.data, self.labels = self.load_data_from_folder(folder)
-        self.transform = transform
-
-    def load_data_from_folder(self, folder):
-        data = []
-        labels = []
-
-        for file_path in folder:
-            with h5.File(file_path, 'r') as h5file:
-                inputs = h5file['shotgather'][:]
-                len_inp = inputs.shape[1]
-                half_ind = len_inp // 2
-                inputs = h5file['shotgather'][:, half_ind:]
-                labels_data = h5file['vsdepth'][:]
-
-                transform_tensor = transforms.Compose([
-                    transforms.ToTensor()
-                ])
-
-                inputs = transform_tensor(inputs)
-
-                data.append(inputs)
-                labels.append(labels_data)
-
-        data = np.array(data)
-
-        labels = np.array(labels)
-        return data, labels
-
-    def __len__(self):
-        return len(self.data)
-
-    def __getitem__(self, idx):
-        inputs = self.data[idx]
-        labels = self.labels[idx]
-
-        # Convert inputs and labels to Tensors
-        inputs = torch.tensor(inputs, dtype=torch.float32)
-        labels = torch.tensor(labels, dtype=torch.float32)
-
-        if self.transform:
-            inputs = self.transform(inputs)
-
-        sample = {'data': inputs, 'label': labels}
-
-        return sample
 
 def create_one_dataset(data_path, dataset_name):
     # Get the folders of the dataset
@@ -94,9 +57,9 @@ def create_one_dataset(data_path, dataset_name):
     test_folder = glob.glob(os.path.join(data_path, dataset_name, 'test', '*'))
 
     # Create the sub datasets
-    train_dataset = CustomDataset(train_folder)
-    validate_dataset = CustomDataset(validate_folder)
-    test_dataset = CustomDataset(test_folder)
+    train_dataset = CustomDataset(train_folder,use_dispersion=True)
+    validate_dataset = CustomDataset(validate_folder,use_dispersion=True)
+    test_dataset = CustomDataset(test_folder,use_dispersion=True)
 
     # Concatenate them
     Dataset = torch.utils.data.ConcatDataset([train_dataset, validate_dataset, test_dataset])
@@ -108,9 +71,20 @@ Dataset = create_one_dataset(data_path, dataset_name)
 
 # Get all the labels from the dataset and all the shot gathers ----------------
 labels = []
+labelsVP = []
 shotgathers = []
 for i in range(len(Dataset)):
-    labels.append(Dataset[i]['label'].numpy())
+    #if labels_VP is present in the dataset, print smthing:
+    if 'label_VP' in Dataset[i]:
+        print('label_VP is present in the dataset')
+        #print('len of label_VP:', len(Dataset[i]['label_VP']))
+    elif 'label_VS' in Dataset[i]:
+        print('label_VS is present in the dataset')
+        #print('len of label_VS:', len(Dataset[i]['label_VS']))
+    else:
+        print('no label in the dataset')
+    labels.append(Dataset[i]['label_VS'].numpy())
+    labelsVP.append(Dataset[i]['label_VP'].numpy())
     shotgathers.append(Dataset[i]['data'].numpy())
 # count the total number of labels
 # Plot the distribution of the labels -----------------------------------------
@@ -193,10 +167,12 @@ def plot_distribution_oral(labels, dataset_name):
     # Définir les bins
     bin_size = 50
     max_label = np.max(labels)
+
     bins = np.arange(0, max_label + bin_size, bin_size)
 
     # Créer la matrice
     distribution = np.zeros((labels[0].shape[0], len(bins) - 1))
+    print('distribution shape:', distribution.shape)
 
     print(f'Nombre de labels: {len(labels)}')
     print(f'Longueur des labels: {labels[0].shape[0]}')
@@ -210,6 +186,11 @@ def plot_distribution_oral(labels, dataset_name):
             for k in range(len(bins) - 1):
                 if bins[k] <= depth < bins[k + 1]:
                     distribution[j,k] += 1
+
+    # Calcul du vecteur moyen des labels à chaque profondeur
+    average_label = np.mean(labels, axis=0)  # (N_profondeurs,)
+    average_label_bins = np.digitize(average_label, bins) - 1  # Trouver l'indice du bin
+    average_label_bins = np.clip(average_label_bins, 0, len(bins) - 2)  # S'assurer que c'est dans les limites
 
     print(f'Taille de la matrice de distribution: {distribution.shape}')
 
@@ -230,6 +211,8 @@ def plot_distribution_oral(labels, dataset_name):
     # Affichage de la matrice
     fig, ax = plt.subplots(figsize=(12, 8))
     cax = ax.imshow(distribution, cmap='viridis', aspect='auto',extent=[0, distribution.shape[1], distribution.shape[0]-1,0])
+    #plot average label in white, dashline:
+    ax.plot(average_label_bins, np.arange(len(average_label)), color='white', linestyle='--', linewidth=2)
     # put a labl for colorbar
     cbar = plt.colorbar(cax)
     cbar.set_label('Occurences', rotation=270, labelpad=20, fontsize=15)
@@ -247,7 +230,7 @@ def plot_distribution_oral(labels, dataset_name):
 
     plt.tight_layout()
     plt.savefig(f'figures/{dataset_name}/distribution_{dataset_name}_oral.pdf',bbox_inches='tight')
-    plt.show()
+    #plt.show()
     plt.close()
 
     print(f'Le plot est disponible ici: figures/distribution_{dataset_name}_oral.pdf')
@@ -257,13 +240,12 @@ def plot_distribution_oral(labels, dataset_name):
 #distribution=plot_distribution(labels, dataset_name)
 
 # Create 2D histogramms associated with distribution 3D plot to give the occurences at a given depth
-
 def plot_2D_histograms(labels, dataset_name):
     #another method to plot 2D histograms.
     # 1 on va définir un vecteur depth
     depths=[10,30,50]
 
-    dz=0.25
+    dz=0.5
 
     for depth in depths:
         # 2 on va lire tous les labels à la profondeur donnée:
@@ -309,10 +291,10 @@ def plot_histograms_thickness(labels, dataset_name):
         layer_thickness = 0
         for i in range(1, len(label)):
             if label[i] == label[i - 1]:
-                layer_thickness += 0.25  # chaque label correspond à 0,25m
+                layer_thickness += 0.5  # chaque label correspond à 0,25m
             else:
                 thickness.append(layer_thickness)
-                layer_thickness = 0.25  # réinitialiser pour la nouvelle couche
+                layer_thickness = 0.5  # réinitialiser pour la nouvelle couche
         thickness.append(layer_thickness)  # Ajouter la dernière couche
 
         thickness_list.append(thickness)
@@ -349,10 +331,10 @@ def plot_histograms_thickness_oral(labels, dataset_name):
         layer_thickness = 0
         for i in range(1, len(label)):
             if label[i] == label[i - 1]:
-                layer_thickness += 0.25  # chaque label correspond à 0,25m
+                layer_thickness += 0.5  # chaque label correspond à 0,25m
             else:
                 thickness.append(layer_thickness)
-                layer_thickness = 0.25  # réinitialiser pour la nouvelle couche
+                layer_thickness = 0.5  # réinitialiser pour la nouvelle couche
         thickness.append(layer_thickness)  # Ajouter la dernière couche
 
         thickness_list.append(thickness)
@@ -369,7 +351,7 @@ def plot_histograms_thickness_oral(labels, dataset_name):
 
     # display
     plt.savefig(f'figures/{dataset_name}/histogram_thickness_{dataset_name}_oral.pdf',format='pdf',bbox_inches='tight')
-    plt.show()
+    #plt.show()
     plt.close()
 # Create the histogram
 #plot_histograms_thickness(labels, dataset_name)
@@ -380,11 +362,11 @@ def plot_histograms_layers(labels, dataset_name):
     Cette fonction crée des histogrammes du nombre de couches pour chaque modèle.
     '''
     print('------------------------------------')
-    print('\nPLOT DES HISTOGRAMMES DU NOMBRE MOYEN DE COUCHES')
+    print('\nPLOT DES HISTOGRAMMES DU NOMBRE DE COUCHES')
 
     nb_layers_list = []
 
-    # 1rst step: calculate the mean number of layers
+    # 1rst step: calculate the number of layers
     for label in labels:
         layers = 1
         for i in range(1, len(label)):
@@ -393,17 +375,21 @@ def plot_histograms_layers(labels, dataset_name):
         nb_layers_list.append(layers)
 
     # 2nd step : plot the histogram
-    bins = np.arange(0, max(nb_layers_list) + 1, 1)  # Ajuster les bins en fonction du nombre moyen de couches
-    plt.hist(nb_layers_list, bins=bins, edgecolor='black')  # Utiliser mean_layers_list pour l'histogramme
+    bins = np.arange(1, max(nb_layers_list) + 2, 1)  # Ajuster les bins pour inclure la dernière valeur
+    counts, edges, patches = plt.hist(nb_layers_list, bins=bins, edgecolor='black', color='royalblue', align='left')
+
+    # Annoter les barres avec les valeurs
+    for count, edge in zip(counts, edges[:-1]):
+        plt.text(edge + 0.5, count + 0.1, str(int(count)), ha='center', fontsize=12, fontweight='bold', color='black')
 
     # plot parameters
-    plt.xlabel('Average number of layers')
+    plt.xticks(np.arange(1, max(nb_layers_list) + 1, 1))  # S'assurer que les ticks sont bien placés
+    plt.xlabel('Nombre de couches')
     plt.ylabel('Occurrences')
-    plt.title(f'histogram showing the number of layers per model({dataset_name})')
+    plt.title(f'Histogramme du nombre de couches par modèle ({dataset_name})')
 
-    # display
-    #plt.show()
-    plt.savefig(f'figures/{dataset_name}/histogram_layers_{dataset_name}.pdf',bbox_inches='tight')
+    # Save & show
+    plt.savefig(f'figures/{dataset_name}/histogram_layers_{dataset_name}.pdf', bbox_inches='tight')
     plt.close()
 
 def plot_histograms_layers_oral(labels, dataset_name):
@@ -411,11 +397,11 @@ def plot_histograms_layers_oral(labels, dataset_name):
     Cette fonction crée des histogrammes du nombre de couches pour chaque modèle.
     '''
     print('------------------------------------')
-    print('\nPLOT DES HISTOGRAMMES DU NOMBRE MOYEN DE COUCHES')
+    print('\nPLOT DES HISTOGRAMMES DU NOMBRE DE COUCHES')
 
     nb_layers_list = []
 
-    # 1rst step: calculate the mean number of layers
+    # 1rst step: calculate the number of layers
     for label in labels:
         layers = 1
         for i in range(1, len(label)):
@@ -424,16 +410,21 @@ def plot_histograms_layers_oral(labels, dataset_name):
         nb_layers_list.append(layers)
 
     # 2nd step : plot the histogram
-    bins = np.arange(0, max(nb_layers_list) + 1, 1)  # Ajuster les bins en fonction du nombre moyen de couches
-    plt.hist(nb_layers_list, bins=bins, edgecolor='black')  # Utiliser mean_layers_list pour l'histogramme
+    bins = np.arange(1, max(nb_layers_list) + 2, 1)  # Inclut bien toutes les valeurs possibles
+    counts, edges, patches = plt.hist(nb_layers_list, bins=bins, edgecolor='black', color='royalblue', align='left')
+
+    # Annoter les barres avec les valeurs
+    for count, edge in zip(counts, edges[:-1]):
+        plt.text(edge + 0.5, count + 0.1, str(int(count)), ha='center', fontsize=12, fontweight='bold', color='black')
 
     # plot parameters
-    plt.xlabel('Average number of layers', fontsize=15)
+    plt.xticks(np.arange(1, max(nb_layers_list) + 1, 1))  # Assure un affichage propre des valeurs
+    plt.xlabel('Nombre de couches', fontsize=15)
     plt.ylabel('Occurrences', fontsize=15)
+    plt.title(f'Histogramme du nombre de couches ({dataset_name})', fontsize=15)
 
-    # display
-    plt.savefig(f'figures/{dataset_name}/histogram_layers_{dataset_name}_oral.pdf',bbox_inches='tight',format='pdf')
-    plt.show()
+    # Save & show
+    plt.savefig(f'figures/{dataset_name}/histogram_layers_{dataset_name}_oral.pdf', bbox_inches='tight', format='pdf')
     plt.close()
 # Create the histogram
 #plot_histograms_layers(labels, dataset_name)
@@ -473,7 +464,6 @@ def plot_histograms_contacts(labels, dataset_name):
 # Create the histogram
 #plot_histograms_contacts(labels, dataset_name)
 
-
 class VSz():
     def __init__(self, labels, dataset_name,z):
         self.labels = labels
@@ -481,7 +471,7 @@ class VSz():
 
     def calculate_vsz(self, labels, z):
         # 1ere étape: lire les labels jusqu'à la profondeur donnée
-        zz = int(z / 0.25)
+        zz = int(z / 0.5)
         labels_cut = []
         for label in labels:
             label_cut = label[:zz]
@@ -491,13 +481,13 @@ class VSz():
         all_h = []
         for label in labels_cut:
             thickness = []
-            layer_thickness = 0.25  # commencer avec une épaisseur initiale
+            layer_thickness = 0.5  # commencer avec une épaisseur initiale
             for i in range(1, len(label)):
                 if label[i] == label[i - 1]:
-                    layer_thickness += 0.25  # chaque label correspond à 0.25m
+                    layer_thickness += 0.5  # chaque label correspond à 0.5m
                 else:
                     thickness.append(layer_thickness)
-                    layer_thickness = 0.25  # réinitialiser pour la nouvelle couche
+                    layer_thickness = 0.5  # réinitialiser pour la nouvelle couche
             # Ajouter l'épaisseur de la dernière couche
             thickness.append(layer_thickness)
             all_h.append(thickness)
@@ -531,7 +521,7 @@ class VSz():
 
         return Vsz_list
 
-    def plot_histograms_VSz(self,labels, dataset_name, z):
+    def plot_histograms_VSz(self,labels, dataset_name, z,wave='Vs'):
         '''
         Cette fonction crée des histogrammes de la vitesse moyenne Vs(z) pour une profondeur donnée z.
         '''
@@ -547,10 +537,10 @@ class VSz():
 
         # plot l'histogramme
         plt.hist(Vsz_list, bins=bins, edgecolor='black')  # Utiliser Vs_z_list pour l'histogramme
-        plt.xlabel(f'Vs{z} (m/s)')
+        plt.xlabel(f'{wave}{z} (m/s)')
         plt.ylabel('Occurrences')
-        plt.title(f'histogram showing the Vs{z} distribution ({dataset_name})')
-        plt.savefig(f'figures/{dataset_name}/histogram_Vs_{dataset_name}_{z}m.pdf',bbox_inches='tight')
+        plt.title(f'histogram showing the {wave}{z} distribution ({dataset_name})')
+        plt.savefig(f'figures/{dataset_name}/histogram_{wave}_{dataset_name}_{z}m.pdf',bbox_inches='tight')
         #plt.show()
         plt.close()
 
@@ -573,7 +563,7 @@ class VSz():
 
         max_vs = 0
         for idx, depth in enumerate(z):
-            zz = int(depth / 0.25)
+            zz = int(depth / 0.5)
 
             # 1ère étape : calcul de la vitesse moyenne Vs(z)
             Vs_z_list= self.calculate_vsz(labels,depth)
@@ -636,13 +626,14 @@ class VSz():
 #VSz_evolution=VSz(labels, dataset_name, [10,20,30,40,50])
 #VSz_evolution.plot_histograms_VSz_evolution_subfigures(labels, dataset_name, [10,20,30,40,50])
 class VSz_oral():
-    def __init__(self, labels, dataset_name,z):
+    def __init__(self, labels, dataset_name,z,wave='Vs'):
         self.labels = labels
         self.Vsz_list = []
+        self.wave = wave
 
     def calculate_vsz(self, labels, z):
         # 1ere étape: lire les labels jusqu'à la profondeur donnée
-        zz = int(z / 0.25)
+        zz = int(z / 0.5)
         labels_cut = []
         for label in labels:
             label_cut = label[:zz]
@@ -652,13 +643,13 @@ class VSz_oral():
         all_h = []
         for label in labels_cut:
             thickness = []
-            layer_thickness = 0.25  # commencer avec une épaisseur initiale
+            layer_thickness = 0.5  # commencer avec une épaisseur initiale
             for i in range(1, len(label)):
                 if label[i] == label[i - 1]:
-                    layer_thickness += 0.25  # chaque label correspond à 0.25m
+                    layer_thickness += 0.5  # chaque label correspond à 0.5m
                 else:
                     thickness.append(layer_thickness)
-                    layer_thickness = 0.25  # réinitialiser pour la nouvelle couche
+                    layer_thickness = 0.5  # réinitialiser pour la nouvelle couche
             # Ajouter l'épaisseur de la dernière couche
             thickness.append(layer_thickness)
             all_h.append(thickness)
@@ -708,10 +699,10 @@ class VSz_oral():
 
         # plot l'histogramme
         plt.hist(Vsz_list, bins=bins, edgecolor='black')  # Utiliser Vs_z_list pour l'histogramme
-        plt.xlabel(f'Vs{z} (m/s)')
+        plt.xlabel(f'{self.wave}{z} (m/s)')
         plt.ylabel('Occurrences')
-        plt.title(f'histogram showing the Vs{z} distribution ({dataset_name})')
-        plt.savefig(f'figures/{dataset_name}/histogram_Vs_{dataset_name}_{z}m.pdf',bbox_inches='tight')
+        plt.title(f'histogram showing the {self.wave}{z} distribution ({dataset_name})')
+        plt.savefig(f'figures/{dataset_name}/histogram_{self.wave}_{dataset_name}_{z}m.pdf',bbox_inches='tight')
         #plt.show()
         plt.close()
 
@@ -734,10 +725,11 @@ class VSz_oral():
 
         max_vs = 0
         for idx, depth in enumerate(z):
-            zz = int(depth / 0.25)
+            zz = int(depth /0.5)
 
             # 1ère étape : calcul de la vitesse moyenne Vs(z)
             Vs_z_list= self.calculate_vsz(labels,depth)
+
 
             # Mise à jour de la valeur maximale pour ajuster les bins
             max_vs = max(Vs_z_list)
@@ -756,7 +748,7 @@ class VSz_oral():
                           alpha=0.7, edgecolor='black', color=colors[idx], align='edge')
 
             # Paramètres de la sous-figure
-            axes[idx].set_ylabel(f'Occurences (%)\nVs(z={depth}m)', fontsize=15)
+            axes[idx].set_ylabel(f'Occurences (%)\n{self.wave}(z={depth}m)', fontsize=15)
             axes[idx].grid(True)
 
             # Suppression des ticks x pour toutes les sous-figures sauf la dernière
@@ -764,20 +756,19 @@ class VSz_oral():
                 axes[idx].tick_params(labelbottom=False)
 
         # Paramètres de l'axe x partagé
-        axes[-1].set_xlabel(f' Vs(z) (m/s)', fontsize=15)
+        axes[-1].set_xlabel(f' {self.wave}(z) (m/s)', fontsize=15)
 
         # Réduction de l'espace autour de la figure pour coller les sous-figures
         plt.tight_layout(rect=[0, 0, 1, 0.98])
 
         # Titre global
-        fig.suptitle(f'Evolution of Vsz : dataset préliminaire)', fontsize=18)
+        fig.suptitle(f'Evolution of {self.wave}z : dataset préliminaire)', fontsize=18)
 
         # Sauvegarde de la figure
-        plt.savefig(f'figures/{dataset_name}/histogram_evolution_VSz_subfig_{dataset_name}_oral.pdf',bbox_inches='tight')
-        plt.show()
+        plt.savefig(f'figures/{dataset_name}/histogram_evolution_{self.wave}z_subfig_{dataset_name}_oral.pdf',bbox_inches='tight')
+        #plt.show()
         plt.close()
-        print('evolution Vsz oral done')
-
+        print(f'evolution {self.wave}z oral done')
 
 def plot_histograms_VSz_evolution_subfigures(labels, dataset_name, depths):
     '''
@@ -798,7 +789,7 @@ def plot_histograms_VSz_evolution_subfigures(labels, dataset_name, depths):
 
     max_vs = 0
     for idx, z in enumerate(depths):
-        zz = int(z / 0.25)
+        zz = int(z / 0.5)
         Vs_z_list = []
 
         # 1ère étape : calcul de la vitesse moyenne Vs(z)
@@ -842,13 +833,6 @@ def plot_histograms_VSz_evolution_subfigures(labels, dataset_name, depths):
     #plt.show()
     plt.close()
 
-
-# Utilisation pour des profondeurs de 10m à 50m
-#plot_histograms_VSz_evolution_subfigures(labels, dataset_name, [10, 20, 30, 40, 50])
-
-# calculer la dérivée de chaque label pour voir les contrasts de vitesse
-# calculer la moyenne de la dérivée pour chaque modèle
-# plot histogramme de la moyenne des dérivées
 def plot_histograms_averagedz(labels, dataset_name):
     '''
     Cette fonction crée des histogrammes de la moyenne des dérivées de Vs pour chaque modèle.
@@ -947,8 +931,6 @@ def plot_histograms_dz(labels, dataset_name):
     #plt.show()
     plt.savefig(f'figures/{dataset_name}/histogram_dz_{dataset_name}.pdf',bbox_inches='tight')
     plt.close()
-
-
 
 #plot_histograms_dz(labels, dataset_name)
 
@@ -1060,8 +1042,9 @@ def plot_disp_images(shotgathers, dataset_name):
 
     # Save and show the figure
     plt.savefig(f'figures/{dataset_name}/disp_images_{dataset_name}.pdf',bbox_inches='tight')
-    plt.close()
     #plt.show()
+    plt.close()
+
 
     # Print the location of the saved figure
     print(f'The plot is available here: figures/{dataset_name}/disp_images_{dataset_name}.pdf')
@@ -1069,12 +1052,11 @@ def plot_disp_images(shotgathers, dataset_name):
 # Plot the dispersion images
 #plot_disp_images(shotgathers, dataset_name)
 
-
 def plot_combined_figure(shotgathers, labels, dataset_name):
     # Parameters
-    dz = 0.25
+    dz = 0.5
     max_label = np.max(labels)  # Assuming labels are normalized, scale them properly
-    fmax, dt, src_pos, rec_pos, dg, off0, off1, ng, offmin, offmax, x, c = acquisition_parameters(dataset_name,max_c=max_label)
+    fmax, dt, src_pos, rec_pos, dg, off0, off1, ng, offmin, offmax, x, c = acquisition_parameters(dataset_name,max_c=3.5)
 
     # Create a figure with GridSpec (2 main columns, 3 sub-columns in each main column, 5 rows)
     fig = plt.figure(figsize=(15, 25))
@@ -1130,15 +1112,14 @@ def plot_combined_figure(shotgathers, labels, dataset_name):
     # Print the location of the saved figure
     print(f'The plot is available here: figures/{dataset_name}/combined_plot_{dataset_name}.pdf')
 
-
 # Plot the combined figure
 #plot_combined_figure(shotgathers, labels, dataset_name)
 
 def plot_combined_figure_oral(shotgathers, labels, dataset_name):
     # Parameters
-    dz = 0.25
+    dz = 0.5
     max_label = np.max(labels)  # Assuming labels are normalized, scale them properly
-    fmax, dt, src_pos, rec_pos, dg, off0, off1, ng, offmin, offmax, x, c = acquisition_parameters(dataset_name, max_c=max_label)
+    fmax, dt, src_pos, rec_pos, dg, off0, off1, ng, offmin, offmax, x, c = acquisition_parameters(dataset_name, max_c=3.5)
 
     nsamples=3
     # Create a figure with GridSpec (4 rows, 3 columns)
@@ -1185,7 +1166,7 @@ def plot_combined_figure_oral(shotgathers, labels, dataset_name):
 
         # Subplot for the dispersion image (third column)
         ax_disp = axes[row_idx, 2]
-        disp = dispersion(shotgathers[idx][0].T, dt, x, c, epsilon=1e-6, fmax=fmax).numpy().T
+        disp = dispersion(shotgathers[idx][0].T, dt, x, c, epsilon=1e-03, fmax=fmax).numpy().T
         disp = (disp - np.min(disp)) / (np.max(disp) - np.min(disp))
         ax_disp.imshow(disp, aspect='auto', cmap='jet')
         xticks_positions = np.linspace(0, disp.shape[1] - 1, 5).astype(int)
@@ -1201,17 +1182,31 @@ def plot_combined_figure_oral(shotgathers, labels, dataset_name):
 
     # Save and show the figure
     plt.savefig(f'figures/{dataset_name}/combined_plot_{dataset_name}_oral.pdf', format='pdf', dpi=300,bbox_inches='tight')
-    plt.show()
+    #plt.show()
     plt.close()
 
     # Print the location of the saved figure
     print(f'The plot is available here: figures/{dataset_name}/combined_plot_{dataset_name}_oral.pdf')
 
 
+
+
+#create seed:
+np.random.seed(42)
 # Prepare oral figures
-#plot_distribution_oral(labels, dataset_name)
-#plot_histograms_layers_oral(labels, dataset_name)
-#plot_histograms_thickness_oral(labels, dataset_name)
-#VSz_evolution_oral=VSz_oral(labels, dataset_name, [10,20,30,40,50])
-#VSz_evolution_oral.plot_histograms_VSz_evolution_subfigures(labels, dataset_name, [10,20,30,40,50])
+plot_distribution_oral(labels, dataset_name)
+plot_histograms_layers_oral(labels, dataset_name)
+plot_histograms_thickness_oral(labels, dataset_name)
+VSz_evolution_oral=VSz_oral(labels, dataset_name, [10,20,30,40,50])
+VSz_evolution_oral.plot_histograms_VSz_evolution_subfigures(labels, dataset_name, [10,20,30,40,50])
 plot_combined_figure_oral(shotgathers, labels, dataset_name)
+
+#do the same for Vp:
+# Prepare oral figures
+plot_distribution_oral(labelsVP, dataset_name)
+plot_histograms_layers_oral(labelsVP, dataset_name)
+plot_histograms_thickness_oral(labelsVP, dataset_name)
+VPz_evolution_oral=VSz_oral(labelsVP, dataset_name, [10,20,30,40,50],wave='Vp')
+VPz_evolution_oral.plot_histograms_VSz_evolution_subfigures(labelsVP, dataset_name, [10,20,30,40,50])
+plot_combined_figure_oral(shotgathers, labelsVP, dataset_name)
+

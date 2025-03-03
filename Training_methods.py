@@ -5,134 +5,105 @@ from PhaseShiftMethod import *
 import torch.optim as optim
 from Utilities import JeffLoss
 import matplotlib.pyplot as plt
+from peft import LoraConfig, get_peft_model
 
-def training(dataset_name='Dataset1Dhuge_96tr',device=None, lr=0.1, nepochs=1, early_stopping_patience=2,alpha=None,beta=None,model=None, dispersion_arg=False, train_dataloader=None, val_dataloader=None, max_label=None):
-    '''
-    Train a neural network model using the provided parameters and return the necessary information for plotting learning curves, and the trained model.
 
-    :param dataset_name: name of the dataset used for training, str
-    :param device: cpu or gpu used for training, torch.device
-    :param lr: learning rate, float
-    :param nepochs: maximum number of epochs, int
-    :param early_stopping_patience: maximum number of epochs without improvement in validation loss, int
-    :param alpha: strenght of the l1 loss, float
-    :param beta: strenght of the blocky term, float
-    :param model: NN architecture used for training, torch.nn.Module
-    :param dispersion_arg: inputs=dispersion image, bool (if False, inputs=shot gathers)
-    :param train_dataloader: training dataloader; torch.utils.data.DataLoader
-    :param val_dataloader: validation dataloader; torch.utils.data.DataLoader
-    :param max_label: maximum velocity value for the labels, int
+def apply_qlora(model):
+    """Apply QLoRA to the model by quantizing layers and enabling LoRA on select layers."""
+    config = LoraConfig(
+        r=8,  # Low-rank dimension
+        lora_alpha=32,  # Scaling factor
+        lora_dropout=0.05,  # Dropout rate
+        target_modules=["fc1", "fc2"],  # Targeted layers for LoRA
+        bias="none",
+    )
+    model = get_peft_model(model, config)
+    return model
 
-    :return:
-    train_losses: training losses; vector
-    val_losses: validation losses; vector
-    epochs_count_train: epochs count for training; vector
-    epochs_count_val: epochs count for validation; vector
-    device: device used for training; torch.device
-    model: trained model; torch.nn.Module
 
-    '''
+def training(
+        dataset_name='Halton_Dataset',
+        device=None, lr=0.1, nepochs=1, early_stopping_patience=2,
+        alpha=None, beta=None, model=None, dispersion_arg=False,
+        train_dataloader=None, val_dataloader=None, max_labelVS=None):
+    """Train a neural network model with QLoRA."""
     print('\nTRAINING LOOP:')
-    #verify all parameters are correctly defined:
     if device is None:
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     if model is None:
         raise ValueError("Model must be provided.")
     if alpha is None or beta is None:
-        alpha = 0;beta = 0
+        alpha, beta = 0, 0
     if train_dataloader is None or val_dataloader is None:
         raise ValueError("Data loaders must be provided.")
-    if max_label is None:
-        print('If max_label is not defined, it will be set to 6000.')
-        max_label = 6000
+    if max_labelVS is None:
+        print('If max_labelVS is not defined, it will be set to 2000.')
+        max_labelVS = 2000
 
-
-
-    print('Device: ', device)
-    model = model.to(device)
-
-    # Load the acquisition parameters if the dispersion image is used
-    if dispersion_arg is not False:
-        fmax, dt, src_pos, rec_pos, dg, off0, off1, ng, offmin, offmax, x, c = acquisition_parameters(dataset_name,max_c=max_label)
-
-    # Initializations
+    print('Device:', device)
+    model = apply_qlora(model).to(device)  # Appliquer QLoRA sur le modèle
     optimizer = optim.Adam(model.parameters(), lr=lr)
-    print(f'Optimizer:{optimizer} Learning rate: {lr}')
-    print('Early stopping is used with patience:', early_stopping_patience)
 
-    # Early stopping parameters
+    print(f'Optimizer: {optimizer}, Learning rate: {lr}')
+    print('Early stopping patience:', early_stopping_patience)
+
     best_val_loss = float('inf')
     epochs_without_improvement = 0
+    train_losses, val_losses = [], []
+    epochs_count_train, epochs_count_val = [], []
 
-    train_losses = []
-    val_losses = []
-    epochs_count_train = []
-    epochs_count_val = []
-
-    print(f'Number of epochs: {nepochs}')
     for epoch in range(nepochs):
         epoch_losses = []
         model.train()
-        for step in range(len(train_dataloader)):
-            sample = train_dataloader.dataset[step]
-            inputs = sample['data']
-            if dispersion_arg is not False:
-                disp = dispersion(inputs[0].T, dt, x, c, epsilon=1e-6, fmax=fmax).numpy().T
-                disp,_,_ = prepare_disp_for_NN(disp)
-                disp = disp.unsqueeze(0).to(device)
-            labels = sample['label']
-            #print('labels:',labels.shape)
-            inputs = inputs.unsqueeze(0)
-            inputs, labels = inputs.to(device), labels.to(device)
+        for step, sample in enumerate(train_dataloader):
+            inputs = sample['data'].to(device)
+            #print('inputs shape:', inputs.shape)
+            labelsVS = sample['label_VS'].to(device)
+            #print('labelsVS shape:', labelsVS.unsqueeze(2).shape)
+
             optimizer.zero_grad()
-            if dispersion_arg is not False:
-                outputs = model(disp)
-            else:
-                outputs = model(inputs)
-            criterion = JeffLoss(l1=alpha,beta=beta)
-            loss = criterion(outputs.float(), labels.permute(1, 0).float())
+
+            # plot input for verification:
+            image=inputs[0][0]
+            image=image.cpu().detach().numpy()
+            print('[training] verification: input shape:', image.shape)
+            plt.imshow(image, aspect='auto', cmap='gray')
+            plt.show()
+            plt.close()
+
+
+            outputs = model(inputs)
+            #print('outputs shape:', outputs.shape)
+            criterion = JeffLoss(l1=alpha, beta=beta)  # Vérifie la définition de cette fonction
+            loss = criterion(outputs.float(), labelsVS.squeeze(2).float())
             loss.backward()
             optimizer.step()
             epoch_losses.append(loss.item())
 
-        #calculate validation loss every 5 epochs, starting from epoch 0
         if epoch % 5 == 0:
-            mean_train_loss = np.mean(epoch_losses)
-            print(f">>> Epoch {epoch} train loss: ", mean_train_loss)
+            mean_train_loss = sum(epoch_losses) / len(epoch_losses)
+            print(f"Epoch {epoch} train loss: {mean_train_loss}")
             train_losses.append(mean_train_loss)
             epochs_count_train.append(epoch)
 
-            # Validation loop
             model.eval()
             val_losses_epoch = []
             with torch.no_grad():
-                for step in range(len(val_dataloader)):
-                    sample = val_dataloader.dataset[step]
-                    inputs = sample['data']
-                    if dispersion_arg is not False:
-                        disp = dispersion(inputs[0].T, dt, x, c, epsilon=1e-6, fmax=25).numpy().T
-                        disp,_,_ = prepare_disp_for_NN(disp)
-                        disp = disp.unsqueeze(0).to(device)
-                    labels = sample['label']
-                    inputs = inputs.unsqueeze(0)
-                    inputs, labels = inputs.to(device), labels.to(device)
-                    if dispersion_arg is not False:
-                        outputs = model(disp)
-                    else:
-                        outputs = model(inputs)
-                    loss = criterion(outputs.float(), labels.permute(1, 0).float())
+                for step, sample in enumerate(val_dataloader):
+                    inputs = sample['data'].to(device)
+                    labelsVS = sample['label_VS'].to(device)
+                    outputs = model(inputs)
+                    loss = criterion(outputs.float(), labelsVS.squeeze(2).float())
                     val_losses_epoch.append(loss.item())
 
-            mean_val_loss = np.mean(val_losses_epoch)
+            mean_val_loss = sum(val_losses_epoch) / len(val_losses_epoch)
             val_losses.append(mean_val_loss)
             epochs_count_val.append(epoch)
-            print(f">>> Epoch {epoch} validation loss: ", mean_val_loss)
+            #print(f"Epoch {epoch} validation loss: {mean_val_loss}")
 
-            # Early stopping check
             if mean_val_loss < best_val_loss:
                 best_val_loss = mean_val_loss
                 epochs_without_improvement = 0
-                # Save the best model here if needed
             else:
                 epochs_without_improvement += 1
                 if epochs_without_improvement >= early_stopping_patience:

@@ -43,9 +43,6 @@ parser.add_argument('--label_reduction','-label',type=float,default=1,required=F
 parser.add_argument('--random_restart','-RR',type=bool,default=False,required=False,help='Random restart')
 parser.add_argument('--alpha','-alpha',type=float,default=0.05,required=False,help='strength of L1 regularization for the loss')
 
-
-
-
 args = parser.parse_args()
 
 # Paths
@@ -104,183 +101,8 @@ print(model)
 unfrozen_parameters=sum(p.numel() for p in model.parameters() if p.requires_grad)
 print('Number of unfrozen parameters:',unfrozen_parameters)
 
-def random_restart_training(device=None, lr=args.lr, nepochs=1000,
-             early_stopping_patience=2, alpha=args.alpha):
-    print('\nTRAINING LOOP:')
-    if device is None:
-        device = "cuda" if torch.cuda.is_available() else "cpu"
-    print('Device: ', device)
-    model = PretrainedVGG19().to(device)
-
-    # Load the acquisition parameters if the dispersion image is used
-    if args.dispersion_image:
-        fmax, dt, src_pos, rec_pos, dg, off0, off1, ng, offmin, offmax, x, c = acquisition_parameters(dataset_name,max_c=max_label)
-
-    # Initializations
-    optimizer = {
-        'Adam': optim.Adam(model.parameters(), lr=lr),
-        'Nadam': optim.NAdam(model.parameters(), lr=lr),
-        'RMSprop': optim.RMSprop(model.parameters(), lr=lr)
-    }.get(args.optimizer, optim.Adam(model.parameters(), lr=lr))
-
-    print(f'Optimizer: {optimizer} Learning rate: {lr}')
-
-    # Early stopping parameters
-    best_val_loss = float('inf')
-    epochs_without_improvement = 0
-    best_model_state = None  # To save the best model
-
-    train_losses = []
-    val_losses = []
-    epochs_count_train = []
-    epochs_count_val = []
-
-    print(f'Number of epochs: {nepochs}')
-    for epoch in range(nepochs):
-        epoch_losses = []
-        model.train()
-        for step in range(len(train_dataloader)):
-            sample = train_dataloader.dataset[step]
-            inputs = sample['data']
-            if args.dispersion_image:
-                disp = dispersion(inputs[0].T, dt, x, c, epsilon=1e-6, fmax=25).numpy().T
-                disp, _, _ = prepare_disp_for_NN(disp)
-                disp = disp.unsqueeze(0).to(device)
-            labels = sample['label']
-            inputs = inputs.unsqueeze(0)
-            inputs, labels = inputs.to(device), labels.to(device)
-            optimizer.zero_grad()
-            outputs = model(disp if args.dispersion_image else inputs)
-            criterion = JeffLoss(l1=alpha)
-            loss = criterion(outputs.float(), labels.permute(1, 0).float())
-            loss.backward()
-            optimizer.step()
-            epoch_losses.append(loss.item())
-
-        if epoch % 5 == 0:
-            mean_train_loss = np.mean(epoch_losses)
-            print(f">>> Epoch {epoch} train loss: ", mean_train_loss)
-            train_losses.append(mean_train_loss)
-            epochs_count_train.append(epoch)
-
-            # Validation loop
-            model.eval()
-            val_losses_epoch = []
-            with torch.no_grad():
-                for step in range(len(val_dataloader)):
-                    sample = val_dataloader.dataset[step]
-                    inputs = sample['data']
-                    if args.dispersion_image:
-                        disp = dispersion(inputs[0].T, dt, x, c, epsilon=1e-6, fmax=25).numpy().T
-                        disp, _, _ = prepare_disp_for_NN(disp)
-                        disp = disp.unsqueeze(0).to(device)
-                    labels = sample['label']
-                    inputs = inputs.unsqueeze(0)
-                    inputs, labels = inputs.to(device), labels.to(device)
-                    outputs = model(disp if args.dispersion_image else inputs)
-                    loss = criterion(outputs.float(), labels.permute(1, 0).float())
-                    val_losses_epoch.append(loss.item())
-
-            mean_val_loss = np.mean(val_losses_epoch)
-            val_losses.append(mean_val_loss)
-            epochs_count_val.append(epoch)
-            print(f">>> Epoch {epoch} validation loss: ", mean_val_loss)
-
-            # Early stopping check
-            if mean_val_loss < best_val_loss:
-                best_val_loss = mean_val_loss
-                epochs_without_improvement = 0
-                best_model_state = model.state_dict()  # Save the best model state
-            else:
-                epochs_without_improvement += 1
-                if epochs_without_improvement >= early_stopping_patience:
-                    print(f"Early stopping at epoch {epoch}, restarting training...")
-                    # Restart model and optimizer when early stopping patience is exceeded
-                    model = PretrainedVGG19().to(device)  # Reinitialize model
-                    optimizer = {
-                        'Adam': optim.Adam(model.parameters(), lr=lr),
-                        'Nadam': optim.NAdam(model.parameters(), lr=lr),
-                        'RMSprop': optim.RMSprop(model.parameters(), lr=lr)
-                    }.get(args.optimizer, optim.Adam(model.parameters(), lr=lr))
-                    epochs_without_improvement = 0  # Reset the counter for early stopping
-
-    # Load the best model state after training
-    if best_model_state is not None:
-        model.load_state_dict(best_model_state)
-        print('Best loss on validation set after Early stopping:', best_val_loss)
-
-    return train_losses, val_losses, epochs_count_train, epochs_count_val, device, model
-
-
-#if GS = True
-if args.GS == True:
-    # Training
-    # Définir la grille des paramètres
-    param_grid = {
-        'alpha': [0.02, 0.03],
-        'beta': [0.05, 0.1, 0.15],
-        'l1': [0.01, 0.05],
-        'v_max': [0.1, 0.2, 0.3]
-    }
-
-    # Grid search
-    best_params = None
-    best_val_loss = float('inf')
-    best_time = 0
-    final_val_losses = []
-    final_train_losses = []
-    final_epochs_count_train = 0
-    final_epochs_count_val = 0
-
-    # init for total time
-    t00 = time.time()
-
-    for params in ParameterGrid(param_grid):
-        print(f"Testing parameters: {params}")
-        alpha = params['alpha']
-        beta = params['beta']
-        l1param = params['l1']
-        vmaxparam = params['v_max']
-
-        # Appel à la fonction de formation
-        t0 = time.time()
-        train_losses, val_losses, epochs_count_train, epochs_count_val, device, model = training(
-            device="cuda" if torch.cuda.is_available() else "cpu",
-            lr=args.lr,
-            nepochs=args.nepochs,
-        )
-        training_time = time.time() - t0
-
-        # Évaluer la perte de validation et mettre à jour les meilleurs paramètres si nécessaire
-        final_val_loss = val_losses[-1] if val_losses else float('inf')
-        if final_val_loss < best_val_loss:
-            best_val_loss = final_val_loss
-            final_val_losses = val_losses
-            final_train_losses = train_losses
-            best_params = params
-            best_time = training_time
-            final_epochs_count_train = epochs_count_train
-            final_epochs_count_val = epochs_count_val
-
-    # total time
-    total_time = time.time() - t00
-    print(f"Best parameters: {best_params} with validation loss: {best_val_loss}")
-    print('\nTraining time best model:', training_time)
-    print('\nTotal Grid search time:', total_time)
-
-else:
-    #use default loss parameters
-    # Training
-    t0 = time.time()
-    if args.random_restart:
-        train_losses, val_losses, epochs_count_train, epochs_count_val, device, model = random_restart_training(
-            device="cuda" if torch.cuda.is_available() else "cpu",
-            lr=args.lr,
-            nepochs=args.nepochs,
-            alpha=args.alpha
-        )
-    else:
-        train_losses, val_losses, epochs_count_train, epochs_count_val, device, model = training(
+t0 = time.time()
+train_losses, val_losses, epochs_count_train, epochs_count_val, device, model = training(
             device="cuda" if torch.cuda.is_available() else "cpu",
             lr=args.lr,
             nepochs=args.nepochs,
@@ -291,12 +113,12 @@ else:
             model=model,
             dispersion_arg=args.dispersion_image
         )
-    best_time = time.time() - t0
-    best_params = {'alpha': 0.00, 'beta': 0.0, 'l1': args.alpha, 'v_max': 0.0}
-    final_val_losses = val_losses
-    final_train_losses = train_losses
-    final_epochs_count_train = epochs_count_train
-    final_epochs_count_val = epochs_count_val
+best_time = time.time() - t0
+best_params = {'alpha': 0.00, 'beta': 0.0, 'l1': args.alpha, 'v_max': 0.0}
+final_val_losses = val_losses
+final_train_losses = train_losses
+final_epochs_count_train = epochs_count_train
+final_epochs_count_val = epochs_count_val
 
 # Display learning curves
 learning_curves(final_epochs_count_train, final_train_losses, final_epochs_count_val, final_val_losses,args.output_dir)
